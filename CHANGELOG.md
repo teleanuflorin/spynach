@@ -25,8 +25,11 @@ Releases are tagged `vX.Y.Z` on GitHub; the version is `spynach.__version__`.
   elements as well (`DD(CF)/CSA(C)`, `DD(CF)/DD(CF')`). Guide `docs/cf3-trosy.md`: the 13C single-quantum block of
   the rotating CF3 group of trifluoromethionine, its chord diagram, the TROSY quartet from six operators, and the
   linewidths against the rotation time. Playground example `try.html#ex-cf3-trosy` with the chord diagram, the
-  19F-coupled and -decoupled 13C spectrum from the exact relaxation modes of Spynach's Liouvillian, and a rotation
-  scan; the parameter-form test now also runs every choice of a list and every checkbox flipped.
+  19F-coupled and -decoupled 13C spectrum from the exact relaxation modes of Spynach's Liouvillian, a rotation scan,
+  and the 19F-13C HSQC with 19F-coupled and -decoupled F1: `spynach.hsqc` on the same Liouvillian, as in the
+  contributed suite's `run07_hsqc.m`, drawn as both maps and as their F1 traces through the 19F line, with a table
+  of the F1 widths against the exact 1D lines. The parameter-form test now also runs every choice of a list and
+  every checkbox flipped.
 - Relaxation at zero and ultralow field: `spynach.pathways.energy_levels` gives the eigenstates of the isotropic
   lab-frame Hamiltonian as levels `|K, F, M>`, sorted into blocks of conserved total projection and total spin of
   each group of equivalent spins. `Levels.adiabatic(from_field)` gives their populations after an adiabatic

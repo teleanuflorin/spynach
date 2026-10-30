@@ -881,7 +881,7 @@ for link in pathways.links()[:10]:
 show_pathways(pathways, split=split, title=f"11BF4- at {magnet:g} T, tau_c = {tau_c:g} ps")
 </script>
 
-<script type="text/plain" class="example" id="ex-cf3-trosy" data-group="Relaxation (spynach)" data-title="13CF3 TROSY with CF3 rotation, and its 13C spectrum">
+<script type="text/plain" class="example" id="ex-cf3-trosy" data-group="Relaxation (spynach)" data-title="13CF3 TROSY with CF3 rotation: 13C spectrum and 19F-13C HSQC">
 import dataclasses
 import logging
 
@@ -899,6 +899,7 @@ symmetrise = True  # GUI: C3-symmetrise | - | Make the group exactly C3-symmetri
 # --- What to show ---
 switch_off = "nothing"  # GUI: Switch off | - | Remove cross-correlations from the relaxation matrix of the six operators, to see what narrows the TROSY line (third trace). DD(CF)/DD(CF') cannot go alone: three C-F dipoles uncorrelated with each other cannot all correlate with one 13C CSA | nothing, DD(CF)/CSA(C), all cross-correlations
 min_rate = 0.5  # GUI: Hide pathways below | s⁻¹ | Chord diagram: pathways with a smaller rate are not drawn | 0..5
+hsqc = True  # GUI: 19F-13C HSQC | - | Simulate the 19F-detected HSQC with 19F-coupled and -decoupled F1: two maps and their F1 traces through the 19F line (a few seconds more)
 
 # DFT geometry (Angstrom), absolute shielding tensors (ppm) and J couplings (Hz), spin order 13C, 19F, 19F, 19F
 SETS = {
@@ -1004,7 +1005,8 @@ show_pathways(pathways, split=True, min_rate=min_rate,
 cf3 = spynach.basis(cf3, {"formalism": "sphten-liouv", "approximation": "none"})
 H = spynach.hamiltonian(spynach.assume(cf3, "nmr"))
 logging.getLogger("spynach").setLevel(logging.ERROR)  # the Redfield integrals take long steps, as they should
-L = H + 1j * spynach.relaxation(cf3)
+R = spynach.relaxation(cf3)
+L = H + 1j * R
 rho = spynach.state(cf3, "L+", "13C")
 label = sum(spynach.state(cf3, ["L+", "Lz"], [0, k]) for k in (1, 2, 3))  # C+ times the total Fz
 coils = np.stack([rho, label], axis=1)
@@ -1090,6 +1092,76 @@ if off:
 top = traces[1].max()
 show_spectrum([t / top for t in traces], axis, names=names, xlabel="13C offset (Hz)", ylabel="intensity (decoupled line = 1)",
               title=f"13C spectrum at {magnet:g} T: exact line shapes from the relaxation modes")
+
+# --- 19F-13C HSQC, as in run07_hsqc.m: 19F excitation and detection with 13C decoupled in F2, and the 13C
+# coherence in t1 either 19F-coupled (the TROSY quartet in F1) or 19F-decoupled by a 19F 180 in the middle of t1.
+# Spynach's port of Spinach's hsqc.m runs on the same Liouvillian, so relaxation acts in every delay (the switch-off
+# above changes only the six-operator model). t1 lasts three decay times of the narrowest line, at most 0.8 s, so
+# that the F1 traces need no apodisation
+
+
+def ft2d(fid, apodise):
+    """States processing of the two pathways (cf3_ft2d.m): F2 zero-order phase, first points halved, optional cosine
+    bell, Fourier transforms of F2 and F1 (zero filling to 4x and 2x), the tallest point real; spectrum[F2, F1]"""
+    pos, neg = fid["pos"].copy(), fid["neg"].copy()
+    phase = np.exp(-0.5j * np.angle(pos[0, 0] * neg[0, 0]))
+    pos, neg = pos * phase, neg * phase
+    for f in (pos, neg):
+        f[0, :] /= 2
+        f[:, 0] /= 2
+    if apodise:
+        bell = np.outer(*(np.cos(np.pi * np.arange(n) / (2 * n)) for n in pos.shape))
+        pos, neg = pos * bell, neg * bell
+    f2 = [np.fft.fftshift(np.fft.fft(f, 4 * pos.shape[0], axis=0), axes=0) for f in (pos, neg)]
+    spec = np.fft.fftshift(np.fft.fft(f2[0] + np.conj(f2[1]), 2 * pos.shape[1], axis=1), axes=1)
+    return spec * np.exp(-1j * np.angle(spec.flat[np.argmax(np.abs(spec))]))
+
+
+def fwhh(trace, k, axis):
+    """Full width at half height of the peak at index k of a trace, by linear interpolation"""
+    t = trace * np.sign(trace[k])
+    half, left, right = t[k] / 2, k, k
+    while left > 0 and t[left] > half:
+        left -= 1
+    while right < len(t) - 1 and t[right] > half:
+        right += 1
+    edge = lambda i, j: axis[i] + (half - t[i]) / (t[j] - t[i]) * (axis[j] - axis[i])
+    return edge(right - 1, right) - edge(left, left + 1)
+
+
+if hsqc:
+    f1_span = 1.5 * abs(J_CF) + 150
+    t1_max = min(3 / (np.pi * narrow["fwhh"]), 0.8)
+    par = {"sweep": [2 * f1_span, 1000.0], "npoints": [int(2 * f1_span * t1_max), 48], "spins": ["13C", "19F"],
+           "J": J_CF, "decouple_f2": ["13C"], "rho0": spynach.state(cf3, "Lz", "19F"), "coil": spynach.state(cf3, "L+", "19F")}
+    fids = {name: spynach.hsqc(cf3, {**par, "decouple_f1": dec}, H, R, 0) for name, dec in (("coupled", []), ("decoupled", ["19F"]))}
+    ax1 = np.fft.fftshift(np.fft.fftfreq(2 * par["npoints"][0], 1 / par["sweep"][0]))
+    ax2 = np.fft.fftshift(np.fft.fftfreq(4 * par["npoints"][1], 1 / par["sweep"][1]))
+    near = np.abs(ax2) <= 250  # F2 window around the 19F line (Hz)
+    for name in fids:
+        z = ft2d(fids[name], True).real[near].T
+        if -z.min() < 0.05 * z.max():  # the map draws each sign to its own extreme: tails of a few percent (in the traces) are left out
+            z = np.maximum(z, 0)
+        show_image(z, ax2[near], ax1, xlabel="F2: 19F offset (Hz)", ylabel="F1: 13C offset (Hz)",
+                   title=f"19F-13C HSQC at {magnet:g} T, F1 19F-{name} (cosine bell)")
+
+    # F1 traces through the 19F line, without apodisation, both scaled to the 19F-decoupled F1 line
+    plain = {name: ft2d(fids[name], False) for name in fids}
+    k2 = np.argmax(np.abs(plain["coupled"]).max(axis=1))
+    trace_c, trace_d = plain["coupled"][k2].real, plain["decoupled"][k2].real
+    peak_d = np.argmax(trace_d)
+    print(f"\nHSQC at {magnet:g} T, t1 = {1e3 * t1_max:.0f} ms ({par['npoints'][0]} points over {par['sweep'][0]:.0f} Hz): F1 lines in the "
+          f"trace through the 19F line, height relative to the 19F-decoupled F1 line ({fwhh(trace_d, peak_d, ax1):.3g} Hz wide)")
+    for line in full:
+        window = np.flatnonzero(np.abs(ax1 - line["f"]) <= max(3.0, line["fwhh"]))
+        k = window[np.argmax(np.abs(trace_c[window]))]
+        print(f"  M_F = {line['M']:+.1f} at {ax1[k]:+7.1f} Hz: height {trace_c[k] / trace_d[peak_d]:5.2f}, FWHH {fwhh(trace_c, k, ax1):6.3g} Hz"
+              f" (exact 1D line {line['fwhh']:.3g} Hz)")
+    if t1_max < 3 / (np.pi * narrow["fwhh"]):
+        print("  t1 is shorter than three decay times of the narrowest line, so its F1 width is set by the acquisition time")
+    show_spectrum([trace_c / trace_d[peak_d], trace_d / trace_d[peak_d]], ax1, names=["F1 19F-coupled: the TROSY quartet", "F1 19F-decoupled"],
+                  xlabel="F1: 13C offset (Hz)", ylabel="intensity (decoupled line = 1)",
+                  title=f"HSQC F1 traces through the 19F line at {magnet:g} T, no apodisation")
 
 # --- Linewidths against the CF3 rotation time, from the six operators: only the correlation times change
 scan = pathways if np.isfinite(tau_int) else spynach.relaxation_pathways(group(50e-12), **observed)

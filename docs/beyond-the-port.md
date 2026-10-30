@@ -247,7 +247,8 @@ quartet of the CF₃ group of trifluoromethionine, and the playground runs
 it as well
 ([`try.html#ex-cf3-trosy`](https://ajerschow.github.io/spynach/try.html#ex-cf3-trosy)):
 the chord diagram of the ¹³C single-quantum block, the ¹³C spectrum with and
-without ¹⁹F decoupling, and the linewidths against the rotation time. At zero
+without ¹⁹F decoupling, the ¹⁹F–¹³C HSQC with ¹⁹F-coupled and -decoupled F1,
+and the linewidths against the rotation time. At zero
 and ultralow field the same analysis runs between the populations of the
 J-coupled energy levels `|K, F, M>`, after an adiabatic transfer from a
 polarising field, and gives the width of every line:

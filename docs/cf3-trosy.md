@@ -19,7 +19,9 @@ GIAO, SMD water), made exactly C₃-symmetric, with the mean ¹J(CF) of
 −255.7 Hz. The browser playground runs the same model
 ([`try.html#ex-cf3-trosy`](https://ajerschow.github.io/spynach/try.html#ex-cf3-trosy)),
 with the field, the tumbling and rotation times, the raw or symmetrised
-tensors and a second parameter set in its form.
+tensors and a second parameter set in its form. It adds the ¹⁹F–¹³C HSQC
+with ¹⁹F-coupled and -decoupled F1, run by `spynach.hsqc` on the same
+Liouvillian: both maps, and their F1 traces through the ¹⁹F line.
 
 Every Python block is executed by `tests/docs/`, in order and in one
 namespace. The expressions need SymPy (`pip install -e ".[symbolic]"`).
