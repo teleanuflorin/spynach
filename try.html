@@ -892,7 +892,7 @@ from scipy.optimize import brentq
 # --- 13CF3 group of trifluoromethionine, with the rotation of the CF3 group about its C3 axis ---
 magnet = 18.8  # GUI: Magnet field | T | Field of the magnet; 18.8 T is an 800 MHz spectrometer | 1..28
 tau_c = 50.0  # GUI: Tumbling time | ns | Isotropic rotational correlation time of the protein | 1..300
-rotation = "50"  # GUI: CF3 rotation time | ps | Correlation time of the rotation of the CF3 group about its C3 axis, on top of the tumbling; rigid switches the rotation off | 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, rigid
+rotation = "50 ps"  # GUI: CF3 rotation time | - | Correlation time of the rotation of the CF3 group about its C3 axis, on top of the tumbling; rigid switches the rotation off | 1 ps, 2 ps, 5 ps, 10 ps, 20 ps, 50 ps, 100 ps, 200 ps, 500 ps, 1 ns, 2 ns, 5 ns, 10 ns, 20 ns, 50 ns, 100 ns, rigid
 parameter_set = "methionine"  # GUI: Parameter set | - | methionine: Ac-L-trifluoromethionine-NH2 (M06/cc-pVDZ, GIAO, SMD water) with its DFT J matrix; cf3ch3: ORCA CF3-CH3 model, 1J(CF) = -280 Hz | methionine, cf3ch3
 symmetrise = True  # GUI: C3-symmetrise | - | Make the group exactly C3-symmetric (mean geometry, C3 images of the averaged 19F tensor); off uses each fluorine's own DFT tensor
 
@@ -959,7 +959,11 @@ if symmetrise:  # sites in order of azimuth; site j carries the C3 image of the 
 
 # CF3 rotation as diffusion about C3 on top of the tumbling (Woessner): D_par = D_perp + 1/tau_int, so the
 # m = +-1 components in the C3 frame decay at 1/tau_int faster than the tumbling (cf3_liouvillian.m)
-tau_int = np.inf if rotation == "rigid" else float(rotation) * 1e-12
+if rotation == "rigid":
+    tau_int = np.inf
+else:
+    value, unit = rotation.split()
+    tau_int = float(value) * {"ps": 1e-12, "ns": 1e-9}[unit]
 
 
 def tumbling(t_int):
@@ -997,7 +1001,7 @@ for link in pathways.links()[:6]:
             print(f"  {pathways.labels[link.source]} <-> {pathways.labels[link.target]}  {cls}: "
                   f"{link.rates[cls]:.4g} = {link.expressions[cls]}")
 show_pathways(pathways, split=True, min_rate=min_rate,
-              title=f"13CF3, 13C single-quantum block: {magnet:g} T, tau_c = {tau_c:g} ns, tau_int = {rotation}" + (" ps" if np.isfinite(tau_int) else ""))
+              title=f"13CF3, 13C single-quantum block: {magnet:g} T, tau_c = {tau_c:g} ns, tau_int = {rotation}")
 
 # --- 13C direct detection: the spin-space Liouvillian L = H + iR of Spynach (Redfield, axial diffusion), as in
 # cf3_liouvillian.m, then the exact relaxation modes of the signal C+ -> C+ (no FFT, no fitting, as in
@@ -1165,7 +1169,7 @@ if hsqc:
 
 # --- Linewidths against the CF3 rotation time, from the six operators: only the correlation times change
 scan = pathways if np.isfinite(tau_int) else spynach.relaxation_pathways(group(50e-12), **observed)
-grid = np.logspace(-12, -8, 41)
+grid = np.logspace(-12, -7, 51)  # 1 ps to 100 ns
 widths = []
 for t_int in grid:
     rates = dataclasses.replace(scan, tau_c=tuple(tumbling(t_int))).rate_matrix(kept)
