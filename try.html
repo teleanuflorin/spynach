@@ -2118,24 +2118,44 @@ post[grid["index"][:, 0], grid["index"][:, 1]] = w
 show_image(post.T / post.max(), np.log10(grid["axes"][0]), np.log10(grid["axes"][1] * 1e9), invert=False,
            xlabel="log10(r / Å)", ylabel="log10(tau_c / ns)", title=f"Posterior of the adaptive run (true r = {r_true:g} Å, tau_c = {tau_c_true:g} ns)")
 
-# Posterior of each target parameter relative to its true value, after both runs
-x = np.linspace(-0.6, 0.6, 1201)
+# Posterior of each target parameter relative to its true value, after both runs, over the range the curves occupy
+def relative(g, p):
+    """log10(value / true value) of parameter p in every cell, shaped like the (r, tau_c) grid"""
+    return np.log10(g["params"][:, p] / true_values[p]).reshape(len(g["axes"][0]), -1)
 
 
 def marginal(g, wts, p):
-    lv = np.log10(g["params"][:, p] / true_values[p])
-    edges = np.linspace(-0.6, 0.6, 121)
-    mass = np.histogram(lv, edges, weights=wts)[0]
-    dens = np.interp(x, (edges[1:] + edges[:-1]) / 2, mass)
-    return dens / max(dens.max(), 1e-300)
+    """Density of parameter p on x (peak = 1). r and tau_c: summed over the other grid axis, read at the grid points.
+    A rate has no axis of its own: every cell is spread over the change of the rate across one grid step, because
+    bins finer than the grid leave gaps between its cells"""
+    lv, wts = relative(g, p), wts.reshape(len(g["axes"][0]), -1)
+    if p < 2:
+        at, where = np.unique(lv[:, 0] if p == 0 else lv[0], return_inverse=True)  # a clipped tau_c axis repeats its ends
+        mass = np.bincount(where, wts.sum(axis=1 - p))
+        density = np.interp(x, at, mass / np.gradient(at), left=0, right=0)
+    else:
+        h = np.maximum(0.5 * (np.abs(np.gradient(lv, axis=0)) + np.abs(np.gradient(lv, axis=1))), 1e-4)
+        keep = wts > 1e-9 * wts.max()
+        density = (wts[keep] / h[keep]) @ np.exp(-0.5 * ((x - lv[keep][:, None]) / h[keep][:, None]) ** 2)
+    return density / max(density.max(), 1e-300)
 
+
+ends = []
+for g, wts in ((grid, w), (fgrid, fw)):
+    for p in aims:
+        lv = relative(g, p).ravel()
+        mean = wts @ lv
+        sd = np.sqrt(wts @ (lv - mean) ** 2)
+        ends += [mean - 5 * sd, mean + 5 * sd]
+lo, hi = min(0.0, *ends), max(0.0, *ends)  # the true value, 0, stays in view
+x = np.linspace(lo - 0.05 * (hi - lo), hi + 0.05 * (hi - lo), 1201)
 
 series, labels = [], []
 for p in aims:
     series += [marginal(grid, w, p), marginal(fgrid, fw, p)]
     labels += [f"{names[p].split()[0]}, adaptive", f"{names[p].split()[0]}, fixed list"]
 show_spectrum(series, x, invert=False, names=labels, xlabel="log10(value / true value)", ylabel="posterior (peak = 1)",
-              title="Posterior of the target parameters: adaptive at its end, the fixed list after 1.5 times as long")
+              title="Posteriors: adaptive at its end, fixed list after 1.5 times as long")
 
 
 # The designs in the plane of d1 and d5 (tau), every point labelled with the shots that used it
