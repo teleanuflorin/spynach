@@ -1898,6 +1898,11 @@ check = np.max(np.abs(np.array([[truth_signal(a, b) for b in taus[::3]] for a in
 print(f"full spin dynamics (Liouville space) against the longitudinal block that the inference uses: max |dy| = {check:.1e}")
 
 
+def with_steps(f):
+    """The model signal on the grid, f[r, tau_c, ...], as rows (signal, its change per grid step of r, of tau_c)"""
+    return np.stack([f, *np.gradient(f, axis=(0, 1))], axis=-1).reshape(-1, *f.shape[2:], 3)
+
+
 def make_grid(axes):
     """Cells of the (r, tau_c) grid: their relaxation matrices, the four parameters, prior and model table"""
     R, T = np.meshgrid(*axes, indexing="ij")
@@ -1906,21 +1911,36 @@ def make_grid(axes):
     lp0 = -0.5 * ((np.log(R.ravel() / r_prior) / r_width) ** 2 + (np.log10(T.ravel() / (tau_c_prior * 1e-9)) / tau_c_width) ** 2)
     index = np.stack(np.meshgrid(*[np.arange(len(a)) for a in axes], indexing="ij"), -1).reshape(-1, 2)
     return {"axes": axes, "Gam": Gam, "params": np.column_stack([R.ravel(), T.ravel() * 1e9, k[:, 0], k[:, 1]]),
-            "index": index, "lp0": lp0, "F": block_signal(Gam, d1s, taus).reshape(len(Gam), -1)}
+            "index": index, "lp0": lp0, "H": with_steps(block_signal(Gam, d1s, taus).reshape(len(axes[0]), len(axes[1]), -1))}
+
+
+cell_sd = 0.5  # how far the parameters may sit from the centre of their cell: standard deviation, in grid steps
 
 
 def start(grid):
-    n = len(grid["lp0"])
-    return {"lp": grid["lp0"] - grid["lp0"].max(), "m": np.full(n, A_prior[0]), "v": np.full(n, A_prior[1] ** 2)}
+    """Every cell: its log-weight, and a Gaussian over z = (A, A dr, A dtau): the amplitude and its products with the
+    offsets of r and tau_c from the centre of the cell, in grid steps, the same for every shot. A cell then stands
+    for its whole area; on a grid coarser than the noise, the centre nearest the data can be far from the truth"""
+    n, (a, sd) = len(grid["lp0"]), A_prior
+    P = np.zeros((n, 3, 3))
+    P[:, 0, 0], P[:, 1, 1], P[:, 2, 2] = sd**2, (a**2 + sd**2) * cell_sd**2, (a**2 + sd**2) * cell_sd**2
+    return {"lp": grid["lp0"] - grid["lp0"].max(), "m": np.tile([a, 0.0, 0.0], (n, 1)), "P": P}
 
 
-def update(st, f, y):
-    """Exact update of p(cell) and of the Gaussian p(A | cell) after one shot, f the model signal of every cell"""
-    s2 = sigma**2 + f**2 * st["v"]
-    r = y - f * st["m"]
+def update(st, h, y):
+    """Exact update of every cell's weight and of its Gaussian over z after one shot: y = h . z + noise, with h the
+    model signal of the cell and its change per grid step of r and of tau_c"""
+    Ph = np.einsum("nij,nj->ni", st["P"], h)
+    s2 = sigma**2 + np.einsum("ni,ni->n", h, Ph)
+    r = y - np.einsum("ni,ni->n", h, st["m"])
     lp = st["lp"] - 0.5 * r**2 / s2 - 0.5 * np.log(s2)
-    gain = st["v"] * f / s2
-    return {"lp": lp - lp.max(), "m": st["m"] + gain * r, "v": st["v"] - gain * f * st["v"]}
+    gain = Ph / s2[:, None]
+    return {"lp": lp - lp.max(), "m": st["m"] + gain * r[:, None], "P": st["P"] - gain[:, :, None] * Ph[:, None, :]}
+
+
+def shot(grid, st, d1, tau, y):
+    """The update for one shot at (d1, tau)"""
+    return update(st, with_steps(block_signal(grid["Gam"], [d1], [tau])[:, 0, 0].reshape(len(grid["axes"][0]), -1)), y)
 
 
 def weights(st):
@@ -1955,16 +1975,17 @@ def eig(grid, st, labels=None):
     keep = np.zeros(len(w), bool)
     keep[np.argsort(w)[-300:]] = True
     keep &= w > 1e-8 * w.max()
-    w, m, v, F = w[keep] / w[keep].sum(), st["m"][keep], st["v"][keep], grid["F"][keep]
+    w, m, P, H = w[keep] / w[keep].sum(), st["m"][keep], st["P"][keep], grid["H"][keep]
+    MU = np.einsum("ndi,ni->dn", H, m)  # the signal each cell predicts for each design, and its spread
+    S = np.sqrt(sigma**2 + np.einsum("ndi,nij,ndj->dn", H, P, H))
     if labels is not None:
         lab = np.unique(labels[keep], return_inverse=True)[1]
         order = np.argsort(lab, kind="stable")
         starts = np.flatnonzero(np.diff(np.concatenate([[-1], lab[order]])))
         wg = np.add.reduceat(w[order], starts)
-    out = np.empty(F.shape[1])
-    for c0 in range(0, F.shape[1], 16):
-        f = F[:, c0:c0 + 16].T
-        mu, s = f * m, np.sqrt(sigma**2 + f**2 * v)
+    out = np.empty(H.shape[1])
+    for c0 in range(0, H.shape[1], 16):
+        mu, s = MU[c0:c0 + 16], S[c0:c0 + 16]
         lo, hi = (mu - 6 * s).min(axis=1), (mu + 6 * s).max(axis=1)
         ny = int(np.clip((hi - lo).max() / (sigma / 2), 61, 240))
         y = lo[:, None] + (hi - lo)[:, None] * np.linspace(0, 1, ny)
@@ -2019,13 +2040,15 @@ def run(policy, budget=np.inf):
         t += (d1 + tau + aq) * (1 + n_dummy * ((d1, tau) != last))
         last = (d1, tau)
         y = A_true * truth_signal(d1, tau) + sigma * rng.standard_normal()
-        st = update(st, block_signal(grid["Gam"], [d1], [tau])[:, 0, 0], y)
+        st = shot(grid, st, d1, tau, y)
         log.append({"d1": d1, "tau": tau, "y": y, "t": t})
-        new = finer(grid, st)
-        if new is not None:  # replay every shot on the finer grid
+        for _ in range(6):  # replay every shot on a finer grid, until the grid resolves the posterior
+            new = finer(grid, st)
+            if new is None:
+                break
             grid, st = new, start(new)
             for e in log:
-                st = update(st, block_signal(grid["Gam"], [e["d1"]], [e["tau"]])[:, 0, 0], e["y"])
+                st = shot(grid, st, e["d1"], e["tau"], e["y"])
         log[-1]["stats"] = summary(grid, weights(st))
         done = max(log[-1]["stats"][p][1] / log[-1]["stats"][p][0] for p in aims) < stop / 100
         if (done or len(log) >= max_shots) if policy == "adaptive" else (t >= budget or len(log) >= 1000):
@@ -2918,8 +2941,8 @@ function ticks(min, max, count) {
   const mag = 10 ** Math.floor(Math.log10(rough));
   const err = rough / mag;
   const step = (err >= 7.5 ? 10 : err >= 3.5 ? 5 : err >= 1.5 ? 2 : 1) * mag;
-  const out = [];
-  for (let v = Math.ceil(min / step) * step; v <= max + step * 1e-6; v += step) out.push(v);
+  const out = [];  // multiples of the step, not a running sum, so that zero comes out as 0
+  for (let i = Math.ceil(min / step); i * step <= max + step * 1e-6; i++) out.push(i * step);
   return out;
 }
 function fmt(v) {
