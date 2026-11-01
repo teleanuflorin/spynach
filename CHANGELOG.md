@@ -46,6 +46,16 @@ Releases are tagged `vX.Y.Z` on GitHub; the version is `spynach.__version__`.
   are in the form.
 - The playground's line plots zoom: drag across a range to zoom in, double-click to zoom back out. The y axis
   follows the samples in range, and tick labels take the decimals that a narrow range needs.
+- Adaptive Bayesian sampling of relaxation, after the contributed MATLAB scripts `adaptive_T1_ir.m` and
+  `adaptive_biexp_v3.m`: the rates on a grid, the amplitude marginalised exactly (a Kalman update per cell), each
+  shot at the design (d1, tau) of largest expected information gain per second, the grid refined around the
+  posterior with every shot replayed, and a fixed delay list run on the same machinery for comparison. Playground
+  `try.html#ex-bayes-t1` has the analytic profiles: inversion recovery for T1, and the polarisation decay or the
+  transient NOE of a homonuclear pair for its two rates k+ and k-. `try.html#ex-bayes-cf` is a 13C-19F pair with
+  Spynach's Redfield relaxation (dipolar coupling and both shielding anisotropies): choose the inverted and the
+  detected spin, and sample for the two rates or for the distance and the correlation time. The data come from the
+  full Liouville-space steady state; the inference uses the longitudinal block of `relaxation_pathways`, scaled by
+  mechanism class (DD as r^-6, DD/CSA as r^-3), which the example checks against the full dynamics.
 - Exact coefficients of the pathway expressions need a numerator of at most 10^4: a large float otherwise matched
   some fraction of large numerator by chance. Pathway operators carry an `info` text, shown on hover in the chord
   diagram. In the playground's line plots, a pixel column of many samples now ends at its last sample, which keeps

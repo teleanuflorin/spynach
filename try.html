@@ -1461,6 +1461,639 @@ for k, line in enumerate(lines):
     print(f"  {line.frequency:14.4f}  {1e3 / R2[k]:8.4g}  {R2[k]:8.4g}  {fwhh[k]:9.4g}  {amplitude[k]:+9.2f}  {line.label}: {parts}")
 </script>
 
+<script type="text/plain" class="example" id="ex-bayes-t1" data-group="Relaxation (spynach)" data-title="Adaptive Bayesian sampling of T1 and of two cross-relaxing spins (analytic)">
+import numpy as np
+
+# --- The measurement: the profile, the truth that makes the data, and the noise ---
+profile = "inversion recovery"  # GUI: Profile | - | inversion recovery: the T1 of one spin (d1 - 180 - tau - 90 - acquire); polarisation decay: a homonuclear pair, spin 1 inverted selectively and detected, two rates k+ = rho + sigma and k- = rho - sigma; transient NOE: the same pair, detected on spin 2 | inversion recovery, polarisation decay, transient NOE
+T1_true = 1.3  # GUI: True T1 | s | The T1 that makes the data (inversion recovery) | 0.05..20
+kp_true = 4.0  # GUI: True k+ | s⁻¹ | Rate of the symmetric mode, rho + sigma (two-rate profiles) | 0.05..30
+km_true = 1.5  # GUI: True k- | s⁻¹ | Rate of the antisymmetric mode, rho - sigma (two-rate profiles) | 0.05..30
+snr = 8.0  # GUI: SNR | - | Fully relaxed signal over the noise of one shot; inversion recovery shows the gain at 8, the two-rate profiles need about 20 | 2..100
+aq = 0.1  # GUI: Acquisition time | s | Charged to every shot, with d1 and tau | 0.01..1
+n_dummy = 0  # GUI: Dummy scans | - | Charged whenever the design changes, while the loop returns to its steady state | 0..4
+seed = 7  # GUI: Noise seed | - | Another seed draws other noise for both runs | 1..100
+
+# --- What is known before, and how to sample ---
+T1_prior = 3.0  # GUI: Prior median T1 | s | Centre of the lognormal prior on T1, deliberately away from the truth | 0.05..20
+k_prior = 1.5  # GUI: Prior median rate | s⁻¹ | Centre of the lognormal priors on k+ and k- | 0.05..30
+prior_width = 1.0  # GUI: Prior width | - | Standard deviation of the natural log of each parameter: 1 spans a factor e each way | 0.2..2
+utility = "EIG per second"  # GUI: Utility | - | EIG per second charges every shot its d1 + tau + aq (and dummy scans); EIG per shot ignores the cost, so d1 runs to the top of its list | EIG per second, EIG per shot
+target = "less certain rate"  # GUI: Target | - | Two-rate profiles: aim every shot at both rates jointly, or at the rate that is less certain at the time | both rates, less certain rate
+schedule = "geometric"  # GUI: Fixed schedule | - | The conventional list it is compared with, cycled: 8 delays up to 3 times the prior's slow time, geometric or linear, with d1 five times that time | geometric, linear
+stop = 5.0  # GUI: Stop at | % | Relative posterior standard deviation of every rate | 1..20
+max_shots = 60  # GUI: Most shots | - | Upper limit of the adaptive run | 10..200
+
+# Adaptive Bayesian design as in adaptive_T1_ir.m and adaptive_biexp_v3.m: the rates live on a grid, the
+# receiver amplitude A is marginalised exactly (a Kalman update in every grid cell), and each shot goes to the
+# design (d1, tau) with the largest expected information gain (EIG) per second. Both runs use the same machinery
+rng = np.random.default_rng(seed)
+sigma, A_true, A_prior = 1 / snr, 1.1, (1.0, 0.2)
+one = profile == "inversion recovery"
+names = ["T1 (s)"] if one else ["k+ (s⁻¹)", "k- (s⁻¹)"]
+truth = np.array([T1_true] if one else [kp_true, km_true])
+centre = np.array([T1_prior] if one else [k_prior, k_prior])
+slow = T1_prior if one else 1 / k_prior  # the prior's slow time
+d1s, taus = slow * np.geomspace(0.02, 10, 6), slow * np.geomspace(0.002, 7, 16)  # on the prior's time scale
+designs = np.array([(d1, tau) for d1 in d1s for tau in taus])
+
+
+def signal(theta, d1, tau):
+    """Steady-state signal of the repeated experiment (fully relaxed = 1); theta (..., P), designs broadcast"""
+    if one:  # the 90 saturates, so the 180 inverts 1 - exp(-(d1 + aq)/T1)
+        T1 = theta[..., 0]
+        return 1 - (2 - np.exp(-(d1 + aq) / T1)) * np.exp(-tau / T1)
+    kp, km = theta[..., 0], theta[..., 1]  # the read pulse saturates both spins, which recover along k+ only
+    b = np.exp(-kp * (d1 + aq))
+    return 1 - np.exp(-kp * tau) + (1 if profile == "transient NOE" else -1) * (1 - b) * np.exp(-km * tau)
+
+
+def make_grid(axes):
+    """Cells of a grid with one log-spaced axis per parameter, their prior log-weights and the model table"""
+    cells = np.stack([m.ravel() for m in np.meshgrid(*axes, indexing="ij")], axis=-1)
+    index = np.stack([i.ravel() for i in np.meshgrid(*[np.arange(len(a)) for a in axes], indexing="ij")], axis=-1)
+    lp0 = -0.5 * (((np.log(cells) - np.log(centre)) / prior_width) ** 2).sum(axis=1)
+    return {"axes": axes, "cells": cells, "index": index, "lp0": lp0,
+            "F": signal(cells[:, None, :], designs[None, :, 0], designs[None, :, 1])}
+
+
+def start(grid):
+    n = len(grid["cells"])
+    return {"lp": grid["lp0"] - grid["lp0"].max(), "m": np.full(n, A_prior[0]), "v": np.full(n, A_prior[1] ** 2)}
+
+
+def update(st, f, y):
+    """Exact update of p(cell) and of the Gaussian p(A | cell) after one shot, f the model signal of every cell"""
+    s2 = sigma**2 + f**2 * st["v"]
+    r = y - f * st["m"]
+    lp = st["lp"] - 0.5 * r**2 / s2 - 0.5 * np.log(s2)
+    gain = st["v"] * f / s2
+    return {"lp": lp - lp.max(), "m": st["m"] + gain * r, "v": st["v"] - gain * f * st["v"]}
+
+
+def weights(st):
+    w = np.exp(st["lp"])
+    return w / w.sum()
+
+
+def summary(grid, w):
+    """Posterior mean, standard deviation and 95% interval of each parameter"""
+    out = []
+    for x in grid["cells"].T:
+        mean, order = w @ x, np.argsort(x)
+        cdf = np.cumsum(w[order])
+        out.append((mean, np.sqrt(w @ (x - mean) ** 2), x[order][np.searchsorted(cdf, 0.025)], x[order][np.searchsorted(cdf, 0.975)]))
+    return out
+
+
+def eig(grid, st, groups=None):
+    """EIG of every design: H[y] - E H[y | cell], or given the group of cells of one parameter, by quadrature in y"""
+    w = weights(st)
+    keep = np.zeros(len(w), bool)
+    keep[np.argsort(w)[-300:]] = True  # the heaviest cells carry the information
+    keep &= w > 1e-8 * w.max()
+    w, m, v, F = w[keep] / w[keep].sum(), st["m"][keep], st["v"][keep], grid["F"][keep]
+    out = np.empty(F.shape[1])
+    for c0 in range(0, F.shape[1], 16):
+        f = F[:, c0:c0 + 16].T  # designs x cells
+        mu, s = f * m, np.sqrt(sigma**2 + f**2 * v)
+        lo, hi = (mu - 6 * s).min(axis=1), (mu + 6 * s).max(axis=1)
+        ny = int(np.clip((hi - lo).max() / (sigma / 2), 61, 240))
+        y = lo[:, None] + (hi - lo)[:, None] * np.linspace(0, 1, ny)
+        dy = (hi - lo) / (ny - 1)
+        pdf = np.exp(-0.5 * ((y[:, None, :] - mu[:, :, None]) / s[:, :, None]) ** 2) / (np.sqrt(2 * np.pi) * s[:, :, None])
+        py = np.einsum("n,cny->cy", w, pdf)
+        h_y = -(py * np.log(py + 1e-300)).sum(axis=1) * dy
+        if groups is None:  # Gaussian given the cell: closed form
+            h_cond = (w * 0.5 * np.log(2 * np.pi * np.e * s**2)).sum(axis=1)
+        else:
+            G = groups[:, keep]
+            wg = G @ w
+            pg = np.einsum("gn,n,cny->cgy", G, w, pdf) / np.maximum(wg, 1e-300)[None, :, None]
+            h_cond = -(wg * (pg * np.log(pg + 1e-300)).sum(axis=2)).sum(axis=1) * dy
+        out[c0:c0 + 16] = h_y - h_cond
+    return out
+
+
+def finer(grid, st):
+    """A finer grid (+-7 posterior std of each log axis) once the posterior is narrower than 1.5 steps of an axis"""
+    w, axes, need = weights(st), [], False
+    for p, axis in enumerate(grid["axes"]):
+        lx = np.log(grid["cells"][:, p])
+        mean = w @ lx
+        sd = np.sqrt(w @ (lx - mean) ** 2)
+        step = np.log(axis[1] / axis[0])
+        new = np.exp(np.linspace(max(np.log(axis[0]), mean - 7 * sd), min(np.log(axis[-1]), mean + 7 * sd), len(axis)))
+        need |= sd < 1.5 * step and np.log(new[1] / new[0]) < 0.7 * step
+        axes.append(new)
+    return make_grid(axes) if need else None
+
+
+def run(policy, budget=np.inf):
+    """One run: 'adaptive' (three shots from the prior, then the best design each time), or a fixed list, cycled"""
+    grid = make_grid([np.geomspace(c * np.exp(-4 * prior_width), c * np.exp(4 * prior_width), 161 if one else 31) for c in centre])
+    st, log, maps, t, last = start(grid), [], [], 0.0, None
+    first = [(5 * slow, slow * np.log(2) * f) for f in (1, np.exp(-prior_width), np.exp(prior_width))] if one else \
+            [(5 * slow, slow * f) for f in (0.3, 1.0, 3.0)]
+    while True:
+        if policy != "adaptive":
+            d1, tau = policy[len(log) % len(policy)]
+        elif len(log) < len(first):
+            d1, tau = first[len(log)]
+        else:
+            groups = None
+            if not one and target == "less certain rate":  # EIG about that rate alone: cells grouped by its value
+                p = int(np.argmax([s[1] / s[0] for s in log[-1]["stats"]]))
+                groups = (grid["index"][:, p] == np.arange(len(grid["axes"][p]))[:, None]).astype(float)
+            gain = eig(grid, st, groups)
+            score = gain / ((designs[:, 0] + designs[:, 1] + aq) * (1 + n_dummy)) if utility == "EIG per second" else gain
+            d1, tau = designs[np.argmax(score)]
+            maps.append(score.reshape(len(d1s), len(taus)))
+        t += (d1 + tau + aq) * (1 + n_dummy * ((d1, tau) != last))
+        last = (d1, tau)
+        y = A_true * signal(truth, d1, tau) + sigma * rng.standard_normal()
+        st = update(st, signal(grid["cells"], d1, tau), y)
+        log.append({"d1": d1, "tau": tau, "y": y, "t": t})
+        new = finer(grid, st)
+        if new is not None:  # replay every shot on the finer grid
+            grid, st = new, start(new)
+            for e in log:
+                st = update(st, signal(grid["cells"], e["d1"], e["tau"]), e["y"])
+        log[-1]["stats"] = summary(grid, weights(st))
+        done = max(s[1] / s[0] for s in log[-1]["stats"]) < stop / 100
+        if (done or len(log) >= max_shots) if policy == "adaptive" else (t >= budget or len(log) >= 2000):
+            return log, grid, weights(st), maps
+
+
+log, grid, w, maps = run("adaptive")
+ladder = np.geomspace(0.05 * slow, 3 * slow, 8) if schedule == "geometric" else np.linspace(3 * slow / 8, 3 * slow, 8)
+fixed, fgrid, fw, _ = run([(5 * slow, tau) for tau in ladder], budget=1.5 * log[-1]["t"])
+
+
+def reached(run_log):
+    """Time and shot at which every relative standard deviation first fell below the stop level"""
+    for k, e in enumerate(run_log):
+        if max(s[1] / s[0] for s in e["stats"]) < stop / 100:
+            return e["t"], k + 1
+    return None, None
+
+
+print(f"{profile}: truth {', '.join(f'{n.split()[0]} = {v:.4g}' for n, v in zip(names, truth))}, SNR {snr:g}, prior median "
+      f"{', '.join(f'{c:.3g}' for c in centre)} (width {prior_width:g} in the log)")
+print(f"{'shot':>4} {'d1 (s)':>8} {'tau (s)':>8} {'y':>8} {'time (s)':>9}   " + "   ".join(f"{n.split()[0]:>14}" for n in names))
+for k, e in enumerate(log):
+    if k < 3 or k % 3 == 0 or k == len(log) - 1:
+        est = "   ".join(f"{s[0]:8.4g} ±{100 * s[1] / s[0]:4.1f}%" for s in e["stats"])
+        print(f"{k + 1:4d} {e['d1']:8.3g} {e['tau']:8.3g} {e['y']:8.3f} {e['t']:9.1f}   {est}" + ("  (prior)" if k < 3 else ""))
+t_a, n_a = reached(log)
+t_f, n_f = reached(fixed)
+final = log[-1]["stats"]
+print(f"\nadaptive: {'reached' if t_a else 'did not reach'} {stop:g}% after {len(log)} shots, {log[-1]['t']:.0f} s; "
+      + ", ".join(f"{n.split()[0]} = {s[0]:.4g} (95% {s[2]:.4g} to {s[3]:.4g}, true {v:.4g})" for n, s, v in zip(names, final, truth)))
+print(f"fixed {schedule} list: " + (f"reached {stop:g}% after {n_f} shots, {t_f:.0f} s: {t_f / log[-1]['t']:.2g} times as long"
+                                   if t_f else f"not at {stop:g}% after {len(fixed)} shots, {fixed[-1]['t']:.0f} s (1.5 times the adaptive run)"))
+
+# Convergence against spectrometer time: relative posterior standard deviation of each rate, after each shot
+times = np.unique([e["t"] for e in log + fixed])
+
+
+def after(run_log, p, x):
+    """Relative standard deviation (%) of parameter p after the last shot before each time x"""
+    t = np.array([e["t"] for e in run_log])
+    rel = np.array([100 * e["stats"][p][1] / e["stats"][p][0] for e in run_log])
+    k = np.searchsorted(t, x, side="right") - 1
+    return np.where(k >= 0, np.log10(rel[np.maximum(k, 0)]), np.nan)
+
+
+series, labels = [], []
+for p, n in enumerate(names):
+    series += [after(log, p, times), after(fixed, p, times)]
+    labels += [f"{n.split()[0]}, adaptive", f"{n.split()[0]}, fixed {schedule} list"]
+show_spectrum(series + [np.full(len(times), np.log10(stop))], times, invert=False, names=labels + [f"stop at {stop:g}%"],
+              xlabel="spectrometer time (s)", ylabel="log10(relative std / %)", title=f"{profile}: how fast the posterior narrows")
+
+# The designs the adaptive run chose, shot by shot, against the time scales of the truth
+shots = np.arange(1, len(log) + 1)
+scales = [T1_true * np.log(2)] if one else [1 / kp_true, 1 / km_true]
+show_spectrum([np.log10([e["tau"] for e in log]), np.log10([e["d1"] for e in log]), np.log10(ladder[(shots - 1) % len(ladder)])]
+              + [np.full(len(shots), np.log10(s)) for s in scales], shots, invert=False,
+              names=["tau, adaptive", "d1, adaptive", f"tau, fixed {schedule} list"] + (["T1 ln2 (null point)"] if one else ["1/k+", "1/k-"]),
+              xlabel="shot", ylabel="log10(delay / s)", title="Where the adaptive design samples (the first three shots come from the prior)")
+
+# Posterior of each parameter: the prior, the adaptive run at its end, and the fixed list after 1.5 times as long
+start_grid = make_grid([np.geomspace(c * np.exp(-4 * prior_width), c * np.exp(4 * prior_width), 161 if one else 31) for c in centre])
+prior_w = np.exp(start_grid["lp0"] - start_grid["lp0"].max())
+prior_w /= prior_w.sum()
+x = np.linspace(*np.log10([min(start_grid["axes"][0][0], truth.min() / 2), max(start_grid["axes"][0][-1], truth.max() * 2)]), 1200)
+
+
+def marginal(g, wts, p):
+    axis = g["axes"][p]
+    mass = np.bincount(g["index"][:, p], weights=wts, minlength=len(axis))
+    density = np.interp(x, np.log10(axis), mass / np.log10(axis[1] / axis[0]), left=0, right=0)
+    return density / density.max()
+
+
+series, labels = [], []
+for p, n in enumerate(names):
+    series += [marginal(start_grid, prior_w, p), marginal(grid, w, p), marginal(fgrid, fw, p)]
+    labels += [f"{n.split()[0]} prior", f"{n.split()[0]} adaptive", f"{n.split()[0]} fixed list"]
+show_spectrum(series, x, invert=False, names=labels, xlabel="log10(" + " or ".join(names) + ")", ylabel="posterior (peak = 1)",
+              title="Posterior: true " + ", ".join(f"{n.split()[0]} = {v:g}" for n, v in zip(names, truth)))
+
+# The design landscape: the utility of every (d1, tau) at the first and at the last adaptive shot
+for k, label in ((0, "first"), (len(maps) - 1, "last")):
+    if maps:
+        show_image(maps[k] / maps[k].max(), np.log10(taus), np.log10(d1s), invert=False, xlabel="log10(tau / s)", ylabel="log10(d1 / s)",
+                   title=f"{utility} of every design at the {label} adaptive shot (maximum = 1)")
+</script>
+
+<script type="text/plain" class="example" id="ex-bayes-cf" data-group="Relaxation (spynach)" data-title="Adaptive Bayesian sampling of a 13C-19F pair: biexponential decay and transient NOE">
+import dataclasses
+import logging
+
+import numpy as np
+import spynach
+from scipy.linalg import expm
+
+# --- The 13C-19F pair: the truth that makes the data ---
+magnet = 9.4  # GUI: Magnet field | T | Field of the magnet | 1..28
+r_true = 1.36  # GUI: True C-F distance | Å | 1.36 Å is a C-F bond; through-space pairs are farther | 1.2..4
+tau_c_true = 0.5  # GUI: True correlation time | ns | Isotropic rotational correlation time | 0.01..100
+csa_F = 80.0  # GUI: 19F CSA | ppm | Shielding anisotropy of the fluorine, axial along the C-F vector; known, as is the field | 0..300
+csa_C = 50.0  # GUI: 13C CSA | ppm | Shielding anisotropy of the carbon, axial along the C-F vector; known | 0..300
+
+# --- The experiment, repeated to steady state: d1 - 180 - tau - 90 - acquire ---
+flip = "19F"  # GUI: Inverted spin | - | The selective 180: 13C or 19F, or both for a non-selective inversion | 13C, 19F, both
+detect = "13C"  # GUI: Detected spin | - | The inverted spin shows the biexponential decay of its own polarisation, the other one the transient NOE | 13C, 19F
+read = "detected spin"  # GUI: Read pulse on | - | The 90 before acquisition hits the detected spin only (two channels) or both spins; it decides what recovers during d1 | detected spin, both spins
+snr = 20.0  # GUI: SNR | - | Fully relaxed signal of the detected spin over the noise of one shot | 2..200
+aq = 0.1  # GUI: Acquisition time | s | Charged to every shot, with d1 and tau | 0.01..1
+n_dummy = 0  # GUI: Dummy scans | - | Charged whenever the design changes | 0..4
+seed = 7  # GUI: Noise seed | - | Another seed draws other noise for both runs | 1..100
+
+# --- What to learn, and what is known before ---
+sample_for = "distance and correlation time"  # GUI: Sample for | - | The design aims at the information about r and tau_c, or about the two rates of the biexponential (the eigenvalues of the Solomon matrix of 13C and 19F) | distance and correlation time, the two rates
+target = "less certain"  # GUI: Target | - | Every shot aims at both parameters jointly, or at the one that is less certain at the time | both, less certain
+r_prior = 1.6  # GUI: Prior median distance | Å | Centre of the lognormal prior on r | 1.2..4
+r_width = 0.25  # GUI: Prior width of r | - | Standard deviation of ln r | 0.05..0.6
+tau_c_prior = 2.0  # GUI: Prior median tau_c | ns | Centre of the lognormal prior on tau_c | 0.01..100
+tau_c_width = 1.0  # GUI: Prior width of tau_c | decades | Standard deviation of log10 tau_c | 0.2..2
+stop = 5.0  # GUI: Stop at | % | Relative posterior standard deviation of both target parameters | 1..20
+max_shots = 60  # GUI: Most shots | - | Upper limit of the adaptive run | 10..200
+
+logging.getLogger("spynach").setLevel(logging.ERROR)
+rng = np.random.default_rng(seed)
+sigma, A_true, A_prior = 1 / snr, 1.1, (1.0, 0.2)
+spins = {"13C": 0, "19F": 1}
+
+
+def pair(r, tau_c):
+    """The 13C-19F pair: dipolar coupling at r (Å), axial shielding tensors along the C-F vector, Redfield"""
+    def axial(aniso):
+        return (aniso * (np.diag([1.0, 0.0, 0.0]) - np.eye(3) / 3)).tolist()
+    return spynach.create(
+        {"isotopes": ["13C", "19F"], "magnet": magnet},
+        {"zeeman": {"matrix": [axial(csa_C), axial(csa_F)]}, "coordinates": [[0, 0, 0], [r, 0, 0]],
+         "relaxation": ["redfield"], "rlx_keep": "secular", "equilibrium": "zero", "tau_c": [tau_c]},
+    )
+
+
+# --- The truth: the full spin dynamics in Liouville space (16 states), with ideal pulses and the exact steady
+# state of the repeated experiment. Coherences left after acquisition are gone before the next 180
+truth = spynach.basis(pair(r_true, tau_c_true * 1e-9), {"formalism": "sphten-liouv", "approximation": "none"})
+
+
+def dense(m):
+    return m.toarray() if hasattr(m, "toarray") else np.asarray(m)
+
+
+G = -1j * dense(spynach.hamiltonian(spynach.assume(truth, "nmr"))) + dense(spynach.relaxation(truth))
+z = [dense(spynach.state(truth, "Lz", k)).ravel() for k in (0, 1)]
+gam = np.asarray(truth.gammas, float)
+rho_eq = gam[0] * z[0] + gam[1] * z[1]
+long = np.stack(z + [dense(spynach.state(truth, ["Lz", "Lz"], [0, 1])).ravel()], axis=1)
+Q_, _ = np.linalg.qr(long)
+keep_long = Q_ @ Q_.conj().T  # projector on Cz, Fz, CzFz
+
+
+def pulse(axis, angle, which):
+    op = sum(spynach.operator(truth, "L" + axis, spins[s]) for s in which)
+    return expm(-1j * angle * dense(op))
+
+
+P180 = pulse("x", np.pi, ["13C", "19F"] if flip == "both" else [flip])
+P90 = pulse("y", np.pi / 2, ["13C", "19F"] if read == "both spins" else [detect])
+coil = dense(spynach.state(truth, "L+", spins[detect])).ravel()
+full_signal = np.real(coil.conj() @ (pulse("y", np.pi / 2, [detect]) @ rho_eq))
+lam, V = np.linalg.eig(G)
+Vi = np.linalg.inv(V)
+
+
+def propagate(t):
+    return (V * np.exp(lam * t)) @ Vi
+
+
+def truth_signal(d1, tau):
+    """Steady state of d1 - 180 - tau - 90 - acquire in Liouville space (fully relaxed signal of the detected spin = 1)"""
+    E1, Et = propagate(d1 + aq), propagate(tau)
+    M = E1 @ keep_long @ P90 @ Et @ P180
+    rho_a = np.linalg.solve(np.eye(len(rho_eq)) - M, rho_eq + E1 @ (keep_long @ P90 @ (rho_eq - Et @ rho_eq) - rho_eq))
+    rho_d = P90 @ (rho_eq + Et @ (P180 @ rho_a - rho_eq))
+    return np.real(coil.conj() @ rho_d) / full_signal
+
+
+# --- The model for inference: the same physics in the longitudinal block {Cz, Fz, CzFz}, which ideal pulses and
+# the loss of coherence keep closed. Spynach's Redfield analysis splits it by mechanism class: DD scales as r^-6,
+# DD/CSA as r^-3 and CSA not at all, and each class takes tau_c through its spectral densities
+r_ref = 1.5
+ref = spynach.relaxation_pathways(pair(r_ref, 1e-9), coherence={"13C": 0, "19F": 0})
+order = [ref.labels.index(n) for n in ("Cz", "Fz", "CzFz")]
+power = {c: 3 * sum(p.startswith("DD") for p in c.split("/")) * (2 if "/" not in c else 1) for c in ref.classes}
+c_eq = np.array([gam[0], gam[1], 0.0])  # equilibrium of the normalised operators
+k_det = spins[detect]
+P = np.diag([-1.0 if flip in ("13C", "both") else 1.0, -1.0 if flip in ("19F", "both") else 1.0,
+             1.0 if flip == "both" else -1.0])
+Q = np.diag([0.0 if (detect == "13C" or read == "both spins") else 1.0,
+             0.0 if (detect == "19F" or read == "both spins") else 1.0, 0.0])
+
+
+def gammas(r, tau_c):
+    """Relaxation matrices (..., 3, 3) of the block for arrays r (Å) and tau_c (s) of one shape"""
+    r, tau_c = np.broadcast_arrays(np.asarray(r, float), np.asarray(tau_c, float))
+    taus_u, inv = np.unique(tau_c, return_inverse=True)
+    per_class = np.array([[dataclasses.replace(ref, tau_c=t).rate_matrix([c])[np.ix_(order, order)] for c in ref.classes] for t in taus_u])
+    scale = np.stack([(r_ref / r) ** power[c] for c in ref.classes], axis=-1)  # (..., classes)
+    return np.einsum("...c,...cij->...ij", scale, per_class[inv.reshape(r.shape)])
+
+
+def block_state(Gam, d1, tau):
+    """Steady state of the block model before the read pulse: Gam (N, 3, 3), d1 (D,), tau (T,) -> (N, D, T, 3)"""
+    w, U = np.linalg.eigh(Gam)
+    def E(t):  # (N, len(t), 3, 3)
+        return np.einsum("nij,ntj,nkj->ntik", U, np.exp(-w[:, None, :] * np.asarray(t, float)[None, :, None]), U)
+    E1, Et = E(np.asarray(d1, float) + aq)[:, :, None], E(tau)[:, None, :]  # (N, D, 1, 3, 3), (N, 1, T, 3, 3)
+    I3, eq = np.eye(3), c_eq[:, None]
+    M = I3 - E1 @ Q @ Et @ P  # one cycle maps the state before the 180 to the next one: c' = M' c + b
+    rhs = ((I3 - E1) @ eq)[..., 0] + (E1 @ Q @ (I3 - Et) @ eq)[..., 0]
+    c_a = np.linalg.solve(M, rhs[..., None])  # the fixed point, before the 180
+    return c_eq + (Et @ (P @ c_a - eq))[..., 0]
+
+
+def block_signal(Gam, d1, tau):
+    """Detected signal of the block model (fully relaxed = 1): (N, D, T)"""
+    return block_state(Gam, d1, tau)[..., k_det] / c_eq[k_det]
+
+
+def solomon_rates(Gam):
+    """The two eigenvalues (slow, fast) of the Solomon matrix of Cz and Fz"""
+    return np.linalg.eigvalsh(Gam[..., :2, :2])
+
+
+Gt = gammas(r_true, tau_c_true * 1e-9)
+k_true = solomon_rates(Gt)
+names = ["r (Å)", "tau_c (ns)", "k_slow (s⁻¹)", "k_fast (s⁻¹)"]
+aims = [0, 1] if sample_for == "distance and correlation time" else [2, 3]
+true_values = np.array([r_true, tau_c_true, *k_true])
+
+# Designs on the scale of the prior: d1 and tau from the slow and fast times of the prior's median system
+k_prior = solomon_rates(gammas(r_prior, tau_c_prior * 1e-9))
+slow, fast = 1 / k_prior[0], 1 / k_prior[1]
+d1s, taus = slow * np.geomspace(0.02, 10, 6), slow * np.geomspace(0.002, 7, 16)
+designs = np.array([(d1, tau) for d1 in d1s for tau in taus])
+print(f"13C-19F at {magnet:g} T, r = {r_true:g} Å, tau_c = {tau_c_true:g} ns: rho(13C) = {Gt[0, 0]:.4g}, rho(19F) = {Gt[1, 1]:.4g}, "
+      f"sigma = {Gt[0, 1]:.4g}, rates k_slow = {k_true[0]:.4g}, k_fast = {k_true[1]:.4g} s⁻¹ (classes {', '.join(ref.classes)})")
+check = np.max(np.abs(np.array([[truth_signal(a, b) for b in taus[::3]] for a in d1s[::2]]) - block_signal(Gt[None], d1s[::2], taus[::3])[0]))
+print(f"full spin dynamics (Liouville space) against the longitudinal block that the inference uses: max |dy| = {check:.1e}")
+
+
+def make_grid(axes):
+    """Cells of the (r, tau_c) grid: their relaxation matrices, the four parameters, prior and model table"""
+    R, T = np.meshgrid(*axes, indexing="ij")
+    Gam = gammas(R.ravel(), T.ravel())
+    k = solomon_rates(Gam)
+    lp0 = -0.5 * ((np.log(R.ravel() / r_prior) / r_width) ** 2 + (np.log10(T.ravel() / (tau_c_prior * 1e-9)) / tau_c_width) ** 2)
+    index = np.stack(np.meshgrid(*[np.arange(len(a)) for a in axes], indexing="ij"), -1).reshape(-1, 2)
+    return {"axes": axes, "Gam": Gam, "params": np.column_stack([R.ravel(), T.ravel() * 1e9, k[:, 0], k[:, 1]]),
+            "index": index, "lp0": lp0, "F": block_signal(Gam, d1s, taus).reshape(len(Gam), -1)}
+
+
+def start(grid):
+    n = len(grid["lp0"])
+    return {"lp": grid["lp0"] - grid["lp0"].max(), "m": np.full(n, A_prior[0]), "v": np.full(n, A_prior[1] ** 2)}
+
+
+def update(st, f, y):
+    """Exact update of p(cell) and of the Gaussian p(A | cell) after one shot, f the model signal of every cell"""
+    s2 = sigma**2 + f**2 * st["v"]
+    r = y - f * st["m"]
+    lp = st["lp"] - 0.5 * r**2 / s2 - 0.5 * np.log(s2)
+    gain = st["v"] * f / s2
+    return {"lp": lp - lp.max(), "m": st["m"] + gain * r, "v": st["v"] - gain * f * st["v"]}
+
+
+def weights(st):
+    w = np.exp(st["lp"])
+    return w / w.sum()
+
+
+def summary(grid, w):
+    out = []
+    for x in grid["params"].T:
+        mean, order = w @ x, np.argsort(x)
+        cdf = np.cumsum(w[order])
+        out.append((mean, np.sqrt(w @ (x - mean) ** 2), x[order][np.searchsorted(cdf, 0.025)], x[order][np.searchsorted(cdf, 0.975)]))
+    return out
+
+
+def labels_for(grid, aim):
+    """Group labels of the cells for the EIG about the target: None (each cell), a grid axis, or bins of the rates"""
+    if aim == "joint" and sample_for == "distance and correlation time":
+        return None
+    if sample_for == "distance and correlation time":
+        return grid["index"][:, aim]
+    def bins(p, n):
+        lk = np.log10(grid["params"][:, p])
+        return np.clip(((lk - lk.min()) / (np.ptp(lk) + 1e-12) * n).astype(int), 0, n - 1)
+    return bins(2, 30) * 30 + bins(3, 30) if aim == "joint" else bins(aim, 60)
+
+
+def eig(grid, st, labels=None):
+    """EIG of every design: H[y] - E H[y | cell or group], by quadrature in y, over the 300 heaviest cells"""
+    w = weights(st)
+    keep = np.zeros(len(w), bool)
+    keep[np.argsort(w)[-300:]] = True
+    keep &= w > 1e-8 * w.max()
+    w, m, v, F = w[keep] / w[keep].sum(), st["m"][keep], st["v"][keep], grid["F"][keep]
+    if labels is not None:
+        lab = np.unique(labels[keep], return_inverse=True)[1]
+        order = np.argsort(lab, kind="stable")
+        starts = np.flatnonzero(np.diff(np.concatenate([[-1], lab[order]])))
+        wg = np.add.reduceat(w[order], starts)
+    out = np.empty(F.shape[1])
+    for c0 in range(0, F.shape[1], 16):
+        f = F[:, c0:c0 + 16].T
+        mu, s = f * m, np.sqrt(sigma**2 + f**2 * v)
+        lo, hi = (mu - 6 * s).min(axis=1), (mu + 6 * s).max(axis=1)
+        ny = int(np.clip((hi - lo).max() / (sigma / 2), 61, 240))
+        y = lo[:, None] + (hi - lo)[:, None] * np.linspace(0, 1, ny)
+        dy = (hi - lo) / (ny - 1)
+        pdf = np.exp(-0.5 * ((y[:, None, :] - mu[:, :, None]) / s[:, :, None]) ** 2) / (np.sqrt(2 * np.pi) * s[:, :, None])
+        py = np.einsum("n,cny->cy", w, pdf)
+        h_y = -(py * np.log(py + 1e-300)).sum(axis=1) * dy
+        if labels is None:
+            h_cond = (w * 0.5 * np.log(2 * np.pi * np.e * s**2)).sum(axis=1)
+        else:
+            pg = np.add.reduceat((w[:, None] * pdf)[:, order], starts, axis=1) / wg[None, :, None]
+            h_cond = -(wg * (pg * np.log(pg + 1e-300)).sum(axis=2)).sum(axis=1) * dy
+        out[c0:c0 + 16] = h_y - h_cond
+    return out
+
+
+def finer(grid, st):
+    """A finer grid (+-7 posterior std of ln r and ln tau_c) once the posterior is narrower than 1.5 steps"""
+    w, axes, need = weights(st), [], False
+    for p, axis in enumerate(grid["axes"]):
+        lx = np.log(axis[grid["index"][:, p]])
+        mean = w @ lx
+        sd = np.sqrt(w @ (lx - mean) ** 2)
+        step = np.log(axis[1] / axis[0])
+        new = np.exp(np.linspace(max(np.log(axis[0]), mean - 7 * sd), min(np.log(axis[-1]), mean + 7 * sd), len(axis)))
+        need |= sd < 1.5 * step and np.log(new[1] / new[0]) < 0.7 * step
+        axes.append(new)
+    return make_grid(axes) if need else None
+
+
+start_axes = [np.geomspace(max(1.0, r_prior * np.exp(-4 * r_width)), r_prior * np.exp(4 * r_width), 28),
+              np.clip(tau_c_prior * 1e-9 * np.logspace(-3.5 * tau_c_width, 3.5 * tau_c_width, 32), 1e-12, 1e-5)]
+
+
+def run(policy, budget=np.inf):
+    """One run: 'adaptive' (three shots from the prior, then the best design each time), or a fixed list, cycled"""
+    grid = make_grid(start_axes)
+    st, log, maps, t, last = start(grid), [], [], 0.0, None
+    k_g = np.sqrt(k_prior[0] * k_prior[1])
+    first = [(5 * slow, f / k_g) for f in (0.3, 1.0, 3.0)]
+    while True:
+        if policy != "adaptive":
+            d1, tau = policy[len(log) % len(policy)]
+        elif len(log) < len(first):
+            d1, tau = first[len(log)]
+        else:
+            stats = log[-1]["stats"]
+            aim = "joint" if target == "both" else aims[int(np.argmax([stats[p][1] / stats[p][0] for p in aims]))]
+            gain = eig(grid, st, labels_for(grid, aim))
+            score = gain / ((designs[:, 0] + designs[:, 1] + aq) * (1 + n_dummy))
+            d1, tau = designs[np.argmax(score)]
+            maps.append(score.reshape(len(d1s), len(taus)))
+        t += (d1 + tau + aq) * (1 + n_dummy * ((d1, tau) != last))
+        last = (d1, tau)
+        y = A_true * truth_signal(d1, tau) + sigma * rng.standard_normal()
+        st = update(st, block_signal(grid["Gam"], [d1], [tau])[:, 0, 0], y)
+        log.append({"d1": d1, "tau": tau, "y": y, "t": t})
+        new = finer(grid, st)
+        if new is not None:  # replay every shot on the finer grid
+            grid, st = new, start(new)
+            for e in log:
+                st = update(st, block_signal(grid["Gam"], [e["d1"]], [e["tau"]])[:, 0, 0], e["y"])
+        log[-1]["stats"] = summary(grid, weights(st))
+        done = max(log[-1]["stats"][p][1] / log[-1]["stats"][p][0] for p in aims) < stop / 100
+        if (done or len(log) >= max_shots) if policy == "adaptive" else (t >= budget or len(log) >= 1000):
+            return log, grid, weights(st), maps
+
+
+log, grid, w, maps = run("adaptive")
+ladder = np.geomspace(0.1 * fast, 3 * slow, 8)
+fixed, fgrid, fw, _ = run([(5 * slow, tau) for tau in ladder], budget=1.5 * log[-1]["t"])
+
+
+def reached(run_log):
+    for k, e in enumerate(run_log):
+        if max(e["stats"][p][1] / e["stats"][p][0] for p in aims) < stop / 100:
+            return e["t"], k + 1
+    return None, None
+
+
+kind = "biexponential decay" if (flip == detect or flip == "both") else "transient NOE"
+print(f"\n{flip} inverted, {detect} detected ({kind}); sampling for {sample_for}, target: {target}")
+print(f"{'shot':>4} {'d1 (s)':>8} {'tau (s)':>8} {'y':>7} {'time (s)':>8}   " + "   ".join(f"{names[p].split()[0]:>16}" for p in aims))
+for k, e in enumerate(log):
+    if k < 3 or k % 4 == 0 or k == len(log) - 1:
+        print(f"{k + 1:4d} {e['d1']:8.3g} {e['tau']:8.3g} {e['y']:7.3f} {e['t']:8.1f}   "
+              + "   ".join(f"{e['stats'][p][0]:9.4g} ±{100 * e['stats'][p][1] / e['stats'][p][0]:4.1f}%" for p in aims) + ("  (prior)" if k < 3 else ""))
+t_a, _ = reached(log)
+t_f, n_f = reached(fixed)
+print(f"\nadaptive: {'reached' if t_a else 'did not reach'} {stop:g}% after {len(log)} shots, {log[-1]['t']:.0f} s")
+for p, n in enumerate(names):
+    m_, sd_, lo_, hi_ = log[-1]["stats"][p]
+    print(f"  {n:13s} {m_:9.4g} ± {sd_:.3g}  (95% {lo_:.4g} to {hi_:.4g}; true {true_values[p]:.4g})" + ("  <- sampled for" if p in aims else ""))
+print(f"fixed list (d1 = {5 * slow:.3g} s, 8 geometric tau): " + (f"reached {stop:g}% after {n_f} shots, {t_f:.0f} s: {t_f / log[-1]['t']:.2g} times as long"
+      if t_f else f"not at {stop:g}% after {len(fixed)} shots, {fixed[-1]['t']:.0f} s (1.5 times the adaptive run)"))
+
+# The signal of the experiment: both spins after the inversion, from a relaxed start (d1 = 5 slow times)
+tt = np.geomspace(taus[0], taus[-1], 300)
+state = block_state(Gt[None], [5 / k_true[0]], tt)[0, 0]
+show_spectrum([state[:, 0] / c_eq[0], state[:, 1] / c_eq[1]], np.log10(tt), invert=False,
+              names=[f"13C{' (detected)' if detect == '13C' else ''}", f"19F{' (detected)' if detect == '19F' else ''}"],
+              xlabel="log10(tau / s)", ylabel="z magnetisation (equilibrium = 1)",
+              title=f"{flip} inverted: rates {k_true[0]:.3g} and {k_true[1]:.3g} s⁻¹ ({kind} on {detect})")
+
+# Convergence of the target parameters against spectrometer time
+times = np.unique([e["t"] for e in log + fixed])
+
+
+def after(run_log, p, x):
+    t = np.array([e["t"] for e in run_log])
+    rel = np.array([100 * e["stats"][p][1] / e["stats"][p][0] for e in run_log])
+    k = np.searchsorted(t, x, side="right") - 1
+    return np.where(k >= 0, np.log10(rel[np.maximum(k, 0)]), np.nan)
+
+
+series, labels = [], []
+for p in aims:
+    series += [after(log, p, times), after(fixed, p, times)]
+    labels += [f"{names[p].split()[0]}, adaptive", f"{names[p].split()[0]}, fixed list"]
+show_spectrum(series + [np.full(len(times), np.log10(stop))], times, invert=False, names=labels + [f"stop at {stop:g}%"],
+              xlabel="spectrometer time (s)", ylabel="log10(relative std / %)", title=f"Sampling for {sample_for}: how fast the posterior narrows")
+
+# The designs, shot by shot, against the two time scales of the truth
+shots = np.arange(1, len(log) + 1)
+show_spectrum([np.log10([e["tau"] for e in log]), np.log10([e["d1"] for e in log]), np.full(len(shots), np.log10(1 / k_true[0])),
+               np.full(len(shots), np.log10(1 / k_true[1]))], shots, invert=False,
+              names=["tau, adaptive", "d1, adaptive", "1/k_slow", "1/k_fast"], xlabel="shot", ylabel="log10(delay / s)",
+              title="Where the adaptive design samples (the first three shots come from the prior)")
+
+# The joint posterior over the distance and the correlation time
+post = np.zeros([len(a) for a in grid["axes"]])
+post[grid["index"][:, 0], grid["index"][:, 1]] = w
+show_image(post.T / post.max(), np.log10(grid["axes"][0]), np.log10(grid["axes"][1] * 1e9), invert=False,
+           xlabel="log10(r / Å)", ylabel="log10(tau_c / ns)", title=f"Posterior of the adaptive run (true r = {r_true:g} Å, tau_c = {tau_c_true:g} ns)")
+
+# Posterior of each target parameter relative to its true value, after both runs
+x = np.linspace(-0.6, 0.6, 1201)
+
+
+def marginal(g, wts, p):
+    lv = np.log10(g["params"][:, p] / true_values[p])
+    edges = np.linspace(-0.6, 0.6, 121)
+    mass = np.histogram(lv, edges, weights=wts)[0]
+    dens = np.interp(x, (edges[1:] + edges[:-1]) / 2, mass)
+    return dens / max(dens.max(), 1e-300)
+
+
+series, labels = [], []
+for p in aims:
+    series += [marginal(grid, w, p), marginal(fgrid, fw, p)]
+    labels += [f"{names[p].split()[0]}, adaptive", f"{names[p].split()[0]}, fixed list"]
+show_spectrum(series, x, invert=False, names=labels, xlabel="log10(value / true value)", ylabel="posterior (peak = 1)",
+              title="Posterior of the target parameters: adaptive at its end, the fixed list after 1.5 times as long")
+
+for k, label in ((0, "first"), (len(maps) - 1, "last")):
+    if maps:
+        show_image(maps[k] / maps[k].max(), np.log10(taus), np.log10(d1s), invert=False, xlabel="log10(tau / s)", ylabel="log10(d1 / s)",
+                   title=f"EIG per second of every design at the {label} adaptive shot (maximum = 1)")
+</script>
+
 <script type="text/plain" class="example" id="ex-powder-fine" data-group="NMR (spynach)" data-title="Powder CSA, 1600 orientations">
 import numpy as np
 import spynach

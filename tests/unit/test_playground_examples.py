@@ -99,6 +99,9 @@ def test_example_runs_and_draws(example, capsys):
         assert all(not call["invert"] for call in recorder.calls[1:]) and "levels |K, F, M>" in printed
         assert recorder.calls[1]["title"].startswith("Spectrum along")
         assert printed.rstrip().rsplit("\n\n", 1)[-1].startswith("Lifetimes of all")
+    elif example_id.startswith("ex-bayes-"):
+        # adaptive Bayesian design: times, delays and parameters run left to right, and the run reports its result
+        assert all(not call["invert"] for call in recorder.calls) and "adaptive:" in printed
     elif group.startswith("EPR"):
         assert all(not call["invert"] for call in recorder.calls), f"{example_id} left an EPR axis inverted"
     else:
