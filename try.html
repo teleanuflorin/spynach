@@ -1672,6 +1672,25 @@ for p, n in enumerate(names):
 show_spectrum(series + [np.full(len(times), np.log10(stop))], times, invert=False, names=labels + [f"stop at {stop:g}%"],
               xlabel="spectrometer time (s)", ylabel="log10(relative std / %)", title=f"{profile}: how fast the posterior narrows")
 
+# The estimates shot by shot: posterior mean and 95% interval of every parameter, for both runs (log10, so that
+# the wide intervals of the first shots leave the later ones readable)
+shot_axis = np.arange(1, max(len(log), len(fixed)) + 1)
+
+
+def per_shot(run_log, p, k):
+    """log10 of statistic k (0 the mean, 2 and 3 the 95% interval) of parameter p after every shot, NaN after the run"""
+    out = np.full(len(shot_axis), np.nan)
+    out[:len(run_log)] = [np.log10(e["stats"][p][k]) for e in run_log]
+    return out
+
+
+for p, n in enumerate(names):
+    symbol, unit = n.split()[0], n[n.index("(") + 1:-1]
+    show_spectrum([per_shot(log, p, 0), per_shot(log, p, 2), per_shot(log, p, 3), per_shot(fixed, p, 0),
+                   np.full(len(shot_axis), np.log10(truth[p]))], shot_axis, invert=False,
+                  names=["adaptive", "adaptive, 95% low", "adaptive, 95% high", f"fixed {schedule} list", "true value"],
+                  xlabel="shot", ylabel=f"log10({symbol} / {unit})", title=f"{symbol} after every shot (true {truth[p]:.4g} {unit})")
+
 # The designs the adaptive run chose, shot by shot, against the time scales of the truth
 shots = np.arange(1, len(log) + 1)
 scales = [T1_true * np.log(2)] if one else [1 / kp_true, 1 / km_true]
@@ -2055,6 +2074,25 @@ for p in aims:
     labels += [f"{names[p].split()[0]}, adaptive", f"{names[p].split()[0]}, fixed list"]
 show_spectrum(series + [np.full(len(times), np.log10(stop))], times, invert=False, names=labels + [f"stop at {stop:g}%"],
               xlabel="spectrometer time (s)", ylabel="log10(relative std / %)", title=f"Sampling for {sample_for}: how fast the posterior narrows")
+
+# The estimates shot by shot: posterior mean and 95% interval of every target parameter, for both runs (log10, so
+# that the wide intervals of the first shots leave the later ones readable)
+shot_axis = np.arange(1, max(len(log), len(fixed)) + 1)
+
+
+def per_shot(run_log, p, k):
+    """log10 of statistic k (0 the mean, 2 and 3 the 95% interval) of parameter p after every shot, NaN after the run"""
+    out = np.full(len(shot_axis), np.nan)
+    out[:len(run_log)] = [np.log10(e["stats"][p][k]) for e in run_log]
+    return out
+
+
+for p in aims:
+    symbol, unit = names[p].split()[0], names[p][names[p].index("(") + 1:-1]
+    show_spectrum([per_shot(log, p, 0), per_shot(log, p, 2), per_shot(log, p, 3), per_shot(fixed, p, 0),
+                   np.full(len(shot_axis), np.log10(true_values[p]))], shot_axis, invert=False,
+                  names=["adaptive", "adaptive, 95% low", "adaptive, 95% high", "fixed list", "true value"],
+                  xlabel="shot", ylabel=f"log10({symbol} / {unit})", title=f"{symbol} after every shot (true {true_values[p]:.4g} {unit})")
 
 # The designs, shot by shot, against the two time scales of the truth
 shots = np.arange(1, len(log) + 1)
