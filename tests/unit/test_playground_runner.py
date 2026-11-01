@@ -30,10 +30,11 @@ class Calls:
         self.lines: list[dict] = []
         self.images: list[dict] = []
         self.chords: list[dict] = []
+        self.points: list[dict] = []
         self.progress: list[tuple] = []
 
     def clear(self) -> None:
-        self.lines, self.images, self.chords, self.progress = [], [], [], []
+        self.lines, self.images, self.chords, self.points, self.progress = [], [], [], [], []
 
 
 CALLS = Calls()
@@ -55,6 +56,7 @@ def install_stubs() -> None:
     )
     js.setImageZ = lambda z: CALLS.images[-1].update(nz=np.asarray(z).size)
     js.beginChord = lambda text: CALLS.chords.append(json.loads(text))
+    js.beginPoints = lambda text: CALLS.points.append(json.loads(text))
     js.reportProgress = lambda run_id, kind, done, total: CALLS.progress.append((kind, done, total))
     pyodide = types.ModuleType("pyodide")
     http = types.ModuleType("pyodide.http")
@@ -98,9 +100,14 @@ def test_runner_executes_example(example, js_stubs, tmp_path):
         assert chord["ribbons"] and chord["arcs"] and chord["title"].startswith("11BF4-")
         assert {"outline", "hover", "colour"} <= set(chord["ribbons"][0])
         return
-    assert js_stubs.lines or js_stubs.images, f"{example_id} drew nothing"
+    assert js_stubs.lines or js_stubs.images or js_stubs.points, f"{example_id} drew nothing"
     for line in js_stubs.lines:
         assert line["series"] and all(n == line["n"] for _, n in line["series"])
+    for plot in js_stubs.points:
+        for item in plot["series"]:
+            assert len(item["x"]) == len(item["y"]) and all(
+                len(item[k]) in (0, len(item["x"])) for k in ("labels", "hover")
+            )
     for image in js_stubs.images:
         assert image["nz"] == image["rows"] * image["cols"] == image["nx"] * image["ny"]
     if group.startswith("EPR"):

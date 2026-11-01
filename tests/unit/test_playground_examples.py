@@ -62,6 +62,14 @@ class Recorder:
             assert np.asarray(y).size == z.shape[0]
         self.calls.append({"kind": "image", "invert": True if invert is None else bool(invert), "title": title})
 
+    def show_points(self, series, *, title="", xlabel="", ylabel=""):
+        sizes = [np.asarray(item["x"]).size for item in series]
+        assert sum(sizes) > 0
+        for item, n in zip(series, sizes):
+            assert np.asarray(item["y"]).size == n
+            assert all(len(item.get(key, [])) in (0, n) for key in ("labels", "hover"))
+        self.calls.append({"kind": "points", "invert": False, "title": title, "xlabel": xlabel})
+
     def show_pathways(self, pathways, *, title="", classes=None, merge=None, split=False, min_rate=0.0):
         from spynach.plotting import chord_layout
 
@@ -81,6 +89,7 @@ def test_example_runs_and_draws(example, capsys):
         "show_fid": recorder.show_fid,
         "show_image": recorder.show_image,
         "show_pathways": recorder.show_pathways,
+        "show_points": recorder.show_points,
     }
     exec(compile(code, f"<{example_id}>", "exec"), ns, ns)
     printed = capsys.readouterr().out
@@ -102,6 +111,7 @@ def test_example_runs_and_draws(example, capsys):
     elif example_id.startswith("ex-bayes-"):
         # adaptive Bayesian design: times, delays and parameters run left to right, and the run reports its result
         assert all(not call["invert"] for call in recorder.calls) and "adaptive:" in printed
+        assert any(call["kind"] == "points" for call in recorder.calls)
     elif group.startswith("EPR"):
         assert all(not call["invert"] for call in recorder.calls), f"{example_id} left an EPR axis inverted"
     else:

@@ -155,9 +155,12 @@ runs the code in its editor; the first load takes a few seconds. The examples
 are grouped by package, NMR, EPR, pathways and relaxation, and a link such as
 `try.html#ex-epr-hyscore` opens and runs one of them. Results are drawn with
 `show_spectrum(y, x)`, `show_fid(fid, sweep)`, `show_image(z, x, y)` (2D
-contours, high ppm at the left and bottom as in `plot_2d`) and
-`show_pathways(pathways)` (the chord diagram of `relaxation_pathways`, see
-below; SymPy is loaded the first time it is needed); an `easyspyn`
+contours, high ppm at the left and bottom as in `plot_2d`),
+`show_points(series)` (a scatter: each series a dict with `x` and `y`, and
+optionally a `name`, a short `labels` text beside each point and a longer
+`hover` text) and `show_pathways(pathways)` (the chord diagram of
+`relaxation_pathways`, see below; SymPy is loaded the first time it is
+needed); an `easyspyn`
 `Spectrum` can be passed as it is, and its field, frequency or time axis then
 runs left to right (`invert=False` does the same for plain arrays). Without
 these calls, a variable named `spectrum` (with `axis`) or `fid` with `sweep`

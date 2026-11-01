@@ -174,7 +174,7 @@ figure.plot figcaption.chord-info { min-height: 4.2em; line-height: 1.45; overfl
     </div>
     <div id="params" aria-label="Parameters" hidden></div>
     <textarea id="editor" spellcheck="false" wrap="off" aria-label="Python source"></textarea>
-    <p class="hint">Ctrl+Enter runs. <code>show_spectrum</code>, <code>show_fid</code> and <code>show_image</code> draw on the right; an <code>easyspyn</code> spectrum can be passed as is, and EPR axes run left to right. Drag across a line plot to zoom in on that range, and double-click it to zoom back out. The 12800-orientation powder is the slow one, about a minute; the 1600-point powder, magic-angle spinning and the fit take a few seconds. Grid names such as <code>leb_2ang_rank_17</code> are loaded from <code>src/spynach/grids</code>. A link such as <code>try.html#ex-epr-hyscore</code> opens and runs one example. <b>Prefer GUI</b> shows the main settings of an example as a form, with units and a description for each, and <b>Prefer code</b> goes back; an edit in the form rewrites the number in the code, and an edit in the code updates the form, and a parameter the code no longer uses is greyed out. If you rewrite the code until no parameter lines are left, <b>Restore example</b> brings the original and its form back, as does reloading the page. <code>?view=params</code> opens the form.</p>
+    <p class="hint">Ctrl+Enter runs. <code>show_spectrum</code>, <code>show_fid</code>, <code>show_image</code> and <code>show_points</code> (a scatter of labelled points) draw on the right; an <code>easyspyn</code> spectrum can be passed as is, and EPR axes run left to right. Drag across a line plot to zoom in on that range, and double-click it to zoom back out. The 12800-orientation powder is the slow one, about a minute; the 1600-point powder, magic-angle spinning and the fit take a few seconds. Grid names such as <code>leb_2ang_rank_17</code> are loaded from <code>src/spynach/grids</code>. A link such as <code>try.html#ex-epr-hyscore</code> opens and runs one example. <b>Prefer GUI</b> shows the main settings of an example as a form, with units and a description for each, and <b>Prefer code</b> goes back; an edit in the form rewrites the number in the code, and an edit in the code updates the form, and a parameter the code no longer uses is greyed out. If you rewrite the code until no parameter lines are left, <b>Restore example</b> brings the original and its form back, as does reloading the page. <code>?view=params</code> opens the form.</p>
   </section>
   <div id="plots"><p class="empty">The spectrum will land here.</p></div>
   <div id="console" role="log" aria-live="polite"></div>
@@ -1592,7 +1592,7 @@ def finer(grid, st):
 def run(policy, budget=np.inf):
     """One run: 'adaptive' (three shots from the prior, then the best design each time), or a fixed list, cycled"""
     grid = make_grid([np.geomspace(c * np.exp(-4 * prior_width), c * np.exp(4 * prior_width), 161 if one else 31) for c in centre])
-    st, log, maps, t, last = start(grid), [], [], 0.0, None
+    st, log, t, last = start(grid), [], 0.0, None
     first = [(5 * slow, slow * np.log(2) * f) for f in (1, np.exp(-prior_width), np.exp(prior_width))] if one else \
             [(5 * slow, slow * f) for f in (0.3, 1.0, 3.0)]
     while True:
@@ -1608,7 +1608,6 @@ def run(policy, budget=np.inf):
             gain = eig(grid, st, groups)
             score = gain / ((designs[:, 0] + designs[:, 1] + aq) * (1 + n_dummy)) if utility == "EIG per second" else gain
             d1, tau = designs[np.argmax(score)]
-            maps.append(score.reshape(len(d1s), len(taus)))
         t += (d1 + tau + aq) * (1 + n_dummy * ((d1, tau) != last))
         last = (d1, tau)
         y = A_true * signal(truth, d1, tau) + sigma * rng.standard_normal()
@@ -1622,12 +1621,12 @@ def run(policy, budget=np.inf):
         log[-1]["stats"] = summary(grid, weights(st))
         done = max(s[1] / s[0] for s in log[-1]["stats"]) < stop / 100
         if (done or len(log) >= max_shots) if policy == "adaptive" else (t >= budget or len(log) >= 2000):
-            return log, grid, weights(st), maps
+            return log, grid, weights(st)
 
 
-log, grid, w, maps = run("adaptive")
+log, grid, w = run("adaptive")
 ladder = np.geomspace(0.05 * slow, 3 * slow, 8) if schedule == "geometric" else np.linspace(3 * slow / 8, 3 * slow, 8)
-fixed, fgrid, fw, _ = run([(5 * slow, tau) for tau in ladder], budget=1.5 * log[-1]["t"])
+fixed, fgrid, fw = run([(5 * slow, tau) for tau in ladder], budget=1.5 * log[-1]["t"])
 
 
 def reached(run_log):
@@ -1720,11 +1719,24 @@ for p, n in enumerate(names):
 show_spectrum(series, x, invert=False, names=labels, xlabel="log10(" + " or ".join(names) + ")", ylabel="posterior (peak = 1)",
               title="Posterior: true " + ", ".join(f"{n.split()[0]} = {v:g}" for n, v in zip(names, truth)))
 
-# The design landscape: the utility of every (d1, tau) at the first and at the last adaptive shot
-for k, label in ((0, "first"), (len(maps) - 1, "last")):
-    if maps:
-        show_image(maps[k] / maps[k].max(), np.log10(taus), np.log10(d1s), invert=False, xlabel="log10(tau / s)", ylabel="log10(d1 / s)",
-                   title=f"{utility} of every design at the {label} adaptive shot (maximum = 1)")
+# The designs in the plane of d1 and d5 (tau), every point labelled with the shots that used it
+def design_points(run_log, shots, name):
+    """One point per design used in the given shots, labelled with their numbers (shortened when there are many)"""
+    used = {}
+    for k in shots:
+        used.setdefault((run_log[k]["d1"], run_log[k]["tau"]), []).append(k + 1)
+
+    def label(ks):
+        return ", ".join(map(str, ks)) if len(ks) <= 4 else f"{ks[0]}, {ks[1]}, … {ks[-1]} ({len(ks)}×)"
+    return {"name": name, "x": [np.log10(tau) for _, tau in used], "y": [np.log10(d1) for d1, _ in used],
+            "labels": [label(ks) for ks in used.values()],
+            "hover": [f"{name}: shot {', '.join(map(str, ks))} at d1 = {d1:.3g} s, d5 = {tau:.3g} s" for (d1, tau), ks in used.items()]}
+
+
+show_points([design_points(log, range(min(3, len(log))), "first three, from the prior"), design_points(log, range(3, len(log)), "adaptive"),
+             {"name": f"fixed {schedule} list", "x": np.log10(ladder), "y": np.full(len(ladder), np.log10(5 * slow)),
+              "hover": [f"fixed list: d1 = {5 * slow:.3g} s, d5 = {tau:.3g} s" for tau in ladder]}],
+            xlabel="log10(d5 = tau / s)", ylabel="log10(d1 / s)", title="The designs: d1 against d5, labelled with the shots that used them")
 </script>
 
 <script type="text/plain" class="example" id="ex-bayes-cf" data-group="Relaxation (spynach)" data-title="Adaptive Bayesian sampling of a 13C-19F pair: biexponential decay and transient NOE">
@@ -1990,7 +2002,7 @@ start_axes = [np.geomspace(max(1.0, r_prior * np.exp(-4 * r_width)), r_prior * n
 def run(policy, budget=np.inf):
     """One run: 'adaptive' (three shots from the prior, then the best design each time), or a fixed list, cycled"""
     grid = make_grid(start_axes)
-    st, log, maps, t, last = start(grid), [], [], 0.0, None
+    st, log, t, last = start(grid), [], 0.0, None
     k_g = np.sqrt(k_prior[0] * k_prior[1])
     first = [(5 * slow, f / k_g) for f in (0.3, 1.0, 3.0)]
     while True:
@@ -2004,7 +2016,6 @@ def run(policy, budget=np.inf):
             gain = eig(grid, st, labels_for(grid, aim))
             score = gain / ((designs[:, 0] + designs[:, 1] + aq) * (1 + n_dummy))
             d1, tau = designs[np.argmax(score)]
-            maps.append(score.reshape(len(d1s), len(taus)))
         t += (d1 + tau + aq) * (1 + n_dummy * ((d1, tau) != last))
         last = (d1, tau)
         y = A_true * truth_signal(d1, tau) + sigma * rng.standard_normal()
@@ -2018,12 +2029,12 @@ def run(policy, budget=np.inf):
         log[-1]["stats"] = summary(grid, weights(st))
         done = max(log[-1]["stats"][p][1] / log[-1]["stats"][p][0] for p in aims) < stop / 100
         if (done or len(log) >= max_shots) if policy == "adaptive" else (t >= budget or len(log) >= 1000):
-            return log, grid, weights(st), maps
+            return log, grid, weights(st)
 
 
-log, grid, w, maps = run("adaptive")
+log, grid, w = run("adaptive")
 ladder = np.geomspace(0.1 * fast, 3 * slow, 8)
-fixed, fgrid, fw, _ = run([(5 * slow, tau) for tau in ladder], budget=1.5 * log[-1]["t"])
+fixed, fgrid, fw = run([(5 * slow, tau) for tau in ladder], budget=1.5 * log[-1]["t"])
 
 
 def reached(run_log):
@@ -2126,10 +2137,25 @@ for p in aims:
 show_spectrum(series, x, invert=False, names=labels, xlabel="log10(value / true value)", ylabel="posterior (peak = 1)",
               title="Posterior of the target parameters: adaptive at its end, the fixed list after 1.5 times as long")
 
-for k, label in ((0, "first"), (len(maps) - 1, "last")):
-    if maps:
-        show_image(maps[k] / maps[k].max(), np.log10(taus), np.log10(d1s), invert=False, xlabel="log10(tau / s)", ylabel="log10(d1 / s)",
-                   title=f"EIG per second of every design at the {label} adaptive shot (maximum = 1)")
+
+# The designs in the plane of d1 and d5 (tau), every point labelled with the shots that used it
+def design_points(run_log, shots, name):
+    """One point per design used in the given shots, labelled with their numbers (shortened when there are many)"""
+    used = {}
+    for k in shots:
+        used.setdefault((run_log[k]["d1"], run_log[k]["tau"]), []).append(k + 1)
+
+    def label(ks):
+        return ", ".join(map(str, ks)) if len(ks) <= 4 else f"{ks[0]}, {ks[1]}, … {ks[-1]} ({len(ks)}×)"
+    return {"name": name, "x": [np.log10(tau) for _, tau in used], "y": [np.log10(d1) for d1, _ in used],
+            "labels": [label(ks) for ks in used.values()],
+            "hover": [f"{name}: shot {', '.join(map(str, ks))} at d1 = {d1:.3g} s, d5 = {tau:.3g} s" for (d1, tau), ks in used.items()]}
+
+
+show_points([design_points(log, range(min(3, len(log))), "first three, from the prior"), design_points(log, range(3, len(log)), "adaptive"),
+             {"name": "fixed list", "x": np.log10(ladder), "y": np.full(len(ladder), np.log10(5 * slow)),
+              "hover": [f"fixed list: d1 = {5 * slow:.3g} s, d5 = {tau:.3g} s" for tau in ladder]}],
+            xlabel="log10(d5 = tau / s)", ylabel="log10(d1 / s)", title="The designs: d1 against d5, labelled with the shots that used them")
 </script>
 
 <script type="text/plain" class="example" id="ex-powder-fine" data-group="NMR (spynach)" data-title="Powder CSA, 1600 orientations">
@@ -2732,7 +2758,7 @@ function bootWorker() {
   if (worker) worker.terminate();
   stopClock();
   setPhase("loading", "Loading Pyodide…");
-  worker = new Worker("worker.js?v=3", { type: "module" });
+  worker = new Worker("worker.js?v=5", { type: "module" });
   worker.onmessage = onWorker;
   worker.onerror = (event) => {
     setPhase("fatal", "The worker failed to start");
@@ -3072,6 +3098,174 @@ function drawLine(canvas, plot, view = null) {
   return { left, right, top, bottom, xLo, xHi, yLo, yHi, invert: plot.invert, x: x.subarray(0, n), series };
 }
 
+function drawPoints(canvas, plot, view = null) {
+  // Scatter plot: every series a set of markers, each point with an optional label beside it and a hover text;
+  // view: the range of x to show when zoomed in, the y range then follows the points inside it
+  const colors = palette();
+  const fg = css("--fg", "#1c2024");
+  const muted = css("--muted", "#5c6670");
+  const grid = css("--line", "#d9ded8");
+  const dpr = window.devicePixelRatio || 1;
+  const width = canvas.clientWidth || 640;
+  const height = 340;
+  canvas.style.height = height + "px";
+  canvas.width = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = css("--surface", "#fff");
+  ctx.fillRect(0, 0, width, height);
+  const left = 58;
+  const right = width - 16;
+  const top = plot.title ? 28 : 14;
+  const bottom = height - 36;
+  const w = Math.max(1, right - left);
+  const h = Math.max(1, bottom - top);
+  // A series keeps its colour and marker when one before it is empty
+  const series = (plot.series || []).map((s, index) => ({ ...s, index })).filter((s) => s.x && s.x.length);
+  if (!series.length) {
+    ctx.fillStyle = muted;
+    ctx.fillText("No points.", left, top + 16);
+    return null;
+  }
+  const xs = [].concat(...series.map((s) => s.x));
+  let [xLo, xHi] = view || extent(xs);
+  const ys = [].concat(...series.map((s) => s.y.filter((_, i) => !view || (s.x[i] >= xLo && s.x[i] <= xHi))));
+  let [yLo, yHi] = extent(ys.length ? ys : [0, 1]);
+  if (!view) {  // room for the markers and labels at the edges
+    const padX = (xHi - xLo) * 0.06;
+    xLo -= padX;
+    xHi += padX * 2.5;
+  }
+  const padY = (yHi - yLo) * 0.1;
+  yLo -= padY;
+  yHi += padY * 2.5;  // headroom for the legend along the top
+  const xPix = (v) => left + ((v - xLo) / (xHi - xLo)) * w;
+  const yPix = (v) => bottom - ((v - yLo) / (yHi - yLo)) * h;
+  ctx.font = "11px " + cssFont();
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = grid;
+  ctx.fillStyle = muted;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  const xTicks = ticks(xLo, xHi, 5);
+  const xLabels = tickLabels(xTicks);
+  xTicks.forEach((tick, i) => {
+    const px = xPix(tick);
+    ctx.beginPath();
+    ctx.moveTo(px, top);
+    ctx.lineTo(px, bottom);
+    ctx.stroke();
+    ctx.fillText(xLabels[i], px, bottom + 6);
+  });
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  const yTicks = ticks(yLo, yHi, 4);
+  const yLabels = tickLabels(yTicks);
+  yTicks.forEach((tick, i) => {
+    const py = yPix(tick);
+    ctx.beginPath();
+    ctx.moveTo(left, py);
+    ctx.lineTo(right, py);
+    ctx.stroke();
+    ctx.fillText(yLabels[i], left - 6, py);
+  });
+  ctx.strokeStyle = fg;
+  ctx.strokeRect(left, top, w, h);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(left, top, w, h);
+  ctx.clip();
+  const marker = (index, px, py) => {
+    ctx.beginPath();
+    if (index % 3 === 1) ctx.rect(px - 4, py - 4, 8, 8);
+    else if (index % 3 === 2) { ctx.moveTo(px, py - 5); ctx.lineTo(px + 5, py + 4); ctx.lineTo(px - 5, py + 4); ctx.closePath(); }
+    else ctx.arc(px, py, 4.5, 0, 2 * Math.PI);
+  };
+  const points = [];
+  series.forEach((s) => {
+    ctx.fillStyle = colors[s.index % colors.length];
+    ctx.strokeStyle = fg;
+    ctx.lineWidth = 0.8;
+    s.x.forEach((x, i) => {
+      const px = xPix(x);
+      const py = yPix(s.y[i]);
+      marker(s.index, px, py);
+      ctx.fill();
+      ctx.stroke();
+      const label = (s.labels || [])[i] || "";
+      const hover = (s.hover || [])[i] || "";
+      points.push({ px, py, text: hover || (s.name ? s.name + ": " : "") + (label || fmt(x) + ", " + fmt(s.y[i])) });
+    });
+  });
+  // Labels: each takes the first place around its point (above right, below right, above left, below left)
+  // that stays inside the frame and runs into no marker and no label already placed
+  ctx.font = "11px " + cssFont();
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.lineWidth = 3;
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = css("--surface", "#fff");
+  ctx.fillStyle = fg;
+  const placed = points.map((p) => [p.px - 5, p.py - 5, p.px + 5, p.py + 5]);
+  const free = (b) =>
+    b[0] >= left && b[2] <= right && b[1] >= top && b[3] <= bottom &&
+    placed.every((o) => b[2] < o[0] || b[0] > o[2] || b[3] < o[1] || b[1] > o[3]);
+  series.forEach((s) => {
+    s.x.forEach((x, i) => {
+      const label = (s.labels || [])[i];
+      if (!label) return;
+      const px = xPix(x);
+      const py = yPix(s.y[i]);
+      const tw = ctx.measureText(label).width;
+      const spots = [[px + 6, py - 5], [px + 6, py + 14], [px - 6 - tw, py - 5], [px - 6 - tw, py + 14]]
+        .map(([lx, ly]) => [lx, ly - 10, lx + tw, ly + 2]);
+      const box = spots.find(free) || spots[0];
+      placed.push(box);
+      ctx.strokeText(label, box[0], box[3] - 2);  // a halo keeps the text readable over grid lines
+      ctx.fillText(label, box[0], box[3] - 2);
+    });
+  });
+  ctx.restore();
+  if (plot.title) {
+    ctx.fillStyle = fg;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.font = "600 13px " + cssFont();
+    ctx.fillText(plot.title, left, 8);
+  }
+  ctx.font = "11px " + cssFont();
+  ctx.fillStyle = muted;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  ctx.fillText(plot.xlabel || "", left + w / 2, height - 2);
+  ctx.save();
+  ctx.translate(12, top + h / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textBaseline = "top";
+  ctx.fillText(plot.ylabel || "", 0, -8);
+  ctx.restore();
+  const named = series.filter((s) => s.name);
+  if (named.length) {  // legend along the top of the frame
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    let lx = left + 8;
+    named.forEach((s) => {
+      ctx.fillStyle = colors[s.index % colors.length];
+      ctx.strokeStyle = fg;
+      ctx.lineWidth = 0.8;
+      marker(s.index, lx + 5, top + 9);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = fg;
+      ctx.fillText(s.name, lx + 14, top + 3);
+      lx += ctx.measureText(s.name).width + 30;
+    });
+  }
+  return { left, right, top, bottom, xLo, xHi, yLo, yHi, invert: false, points };
+}
+
 function contourLevels(zLo, zHi) {
   const ncont = 12;
   const levels = [];
@@ -3390,7 +3584,7 @@ function render(plots) {
   if (!plots.length) {
     const empty = document.createElement("p");
     empty.className = "empty";
-    empty.textContent = "No plot. Call show_spectrum, show_fid, show_image or show_pathways, or leave a spectrum variable.";
+    empty.textContent = "No plot. Call show_spectrum, show_fid, show_image, show_points or show_pathways, or leave a spectrum variable.";
     plotsEl.appendChild(empty);
     return;
   }
@@ -3406,8 +3600,9 @@ function render(plots) {
     const caption = document.createElement("figcaption");
     figure.append(canvas, caption);
     plotsEl.appendChild(figure);
-    let map = plot.kind === "image" ? drawImage(canvas, plot) : drawLine(canvas, plot);
-    // Line plots zoom in on a range of x dragged across, and back out on a double click
+    const draw = plot.kind === "points" ? drawPoints : drawLine;
+    let map = plot.kind === "image" ? drawImage(canvas, plot) : draw(canvas, plot);
+    // Line and point plots zoom in on a range of x dragged across, and back out on a double click
     let view = null;
     let drag = null;
     const pointer = (event) => {
@@ -3419,7 +3614,7 @@ function render(plots) {
       return map.invert ? map.xHi - tx * (map.xHi - map.xLo) : map.xLo + tx * (map.xHi - map.xLo);
     };
     const inside = (px) => Math.min(map.right, Math.max(map.left, px));
-    const redraw = () => { map = drawLine(canvas, plot, view); };
+    const redraw = () => { map = draw(canvas, plot, view); };
     if (map && plot.kind !== "image") {
       canvas.title = "Drag across a range to zoom in, double-click to zoom out";
       canvas.style.cursor = "crosshair";
@@ -3456,6 +3651,15 @@ function render(plots) {
       const yVal = map.image && map.invert
         ? map.yLo + ty * (map.yHi - map.yLo)
         : map.yHi - ty * (map.yHi - map.yLo);
+      if (map.points) {  // the nearest point within 12 px, else the coordinates under the pointer
+        let best = null;
+        for (const p of map.points) {
+          const d = Math.hypot(p.px - px, p.py - py);
+          if (d < 12 && (!best || d < best.d)) best = { d, text: p.text };
+        }
+        caption.textContent = best ? best.text : fmt(xVal) + ", " + fmt(yVal);
+        return;
+      }
       caption.textContent = map.image
         ? fmt(xVal) + ", " + fmt(yVal)
         : (view ? fmtIn(xVal, map.xHi - map.xLo) : fmt(xVal)) + "   " + fmt(nearest(map, xVal));

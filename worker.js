@@ -84,7 +84,7 @@ import traceback
 import numpy as np
 import easyspyn
 import spynach
-from js import addSeries, beginChord, beginImage, beginLine, reportProgress, setImageZ
+from js import addSeries, beginChord, beginImage, beginLine, beginPoints, reportProgress, setImageZ
 from pyodide.http import pyfetch
 
 state = {"called": False}
@@ -246,6 +246,27 @@ def show_pathways(pathways, *, title="", classes=None, merge=None, split=False, 
     layout["title"] = str(title)
     beginChord(json.dumps(layout))
 
+def show_points(series, *, title="", xlabel="", ylabel=""):
+    """Scatter plot: series is a list of dicts with "x" and "y" (one value per point), and optionally "name",
+    "labels" (a short text drawn next to each point) and "hover" (a longer text shown when the pointer is near)."""
+    state["called"] = True
+    items = []
+    for i, s in enumerate(series):
+        x = np.asarray(s["x"], dtype=float).ravel()
+        y = np.asarray(s["y"], dtype=float).ravel()
+        if x.shape != y.shape:
+            raise ValueError(f"show_points: series {i} has {x.size} x values and {y.size} y values.")
+        texts = {}
+        for key in ("labels", "hover"):
+            values = [str(v) for v in s.get(key, [])]
+            if values and len(values) != x.size:
+                raise ValueError(f"show_points: series {i} has {x.size} points and {len(values)} {key}.")
+            texts[key] = values
+        items.append({"name": str(s.get("name", "")), "x": x.tolist(), "y": y.tolist(), **texts})
+    if not any(item["x"] for item in items):
+        raise ValueError("show_points received no points.")
+    beginPoints(json.dumps({"title": str(title), "xlabel": str(xlabel), "ylabel": str(ylabel), "series": items}))
+
 def _orientation_hook(kind):
     last = [0.0]
     def report(done, total):
@@ -308,6 +329,7 @@ try:
         "show_fid": show_fid,
         "show_image": show_image,
         "show_pathways": show_pathways,
+        "show_points": show_points,
     }
     exec(compile(USER_CODE, "<editor>", "exec"), ns, ns)
     if not state["called"]:
@@ -417,6 +439,14 @@ self.beginChord = (json) => {
   }
 };
 
+self.beginPoints = (json) => {
+  try {
+    bucket.push({ kind: "points", ...JSON.parse(String(json)) });
+  } catch (err) {
+    post({ type: "stderr", text: "Could not read the points: " + err + "\n" });
+  }
+};
+
 function mkdirp(dir) {
   const parts = dir.split("/").filter(Boolean);
   let cur = "";
@@ -491,10 +521,12 @@ async function handle(message) {
     const errProxy = pyodide.globals.get("RUN_ERROR");
     const error = errProxy ? String(errProxy) : "";
     if (errProxy && typeof errProxy.destroy === "function") errProxy.destroy();
+    // Typed arrays travel by transfer; the point plots' plain arrays are copied
     const transfer = [];
+    const buffers = (v) => (ArrayBuffer.isView(v) ? [v.buffer] : []);
     for (const plot of bucket) {
-      for (const key of ["x", "y", "z"]) if (plot[key]) transfer.push(plot[key].buffer);
-      if (plot.series) for (const series of plot.series) if (series.y) transfer.push(series.y.buffer);
+      for (const key of ["x", "y", "z"]) transfer.push(...buffers(plot[key]));
+      if (plot.series) for (const series of plot.series) transfer.push(...buffers(series.y));
     }
     post({ type: "result", id, plots: bucket, error }, transfer);
   } catch (err) {

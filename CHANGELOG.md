@@ -55,7 +55,10 @@ Releases are tagged `vX.Y.Z` on GitHub; the version is `spynach.__version__`.
   Spynach's Redfield relaxation (dipolar coupling and both shielding anisotropies): choose the inverted and the
   detected spin, and sample for the two rates or for the distance and the correlation time. The data come from the
   full Liouville-space steady state; the inference uses the longitudinal block of `relaxation_pathways`, scaled by
-  mechanism class (DD as r^-6, DD/CSA as r^-3), which the example checks against the full dynamics.
+  mechanism class (DD as r^-6, DD/CSA as r^-3), which the example checks against the full dynamics. Both examples
+  plot the estimates against the number of shots, and the designs used in the plane of d1 and d5 (tau), each
+  labelled with the shots that used it, through the playground's new `show_points` (a scatter of labelled points
+  with a hover text per point).
 - Exact coefficients of the pathway expressions need a numerator of at most 10^4: a large float otherwise matched
   some fraction of large numerator by chance. Pathway operators carry an `info` text, shown on hover in the chord
   diagram. In the playground's line plots, a pixel column of many samples now ends at its last sample, which keeps
