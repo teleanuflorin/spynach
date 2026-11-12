@@ -2201,6 +2201,491 @@ show_points([design_points(log, range(min(3, len(log))), "first three, from the 
             xlabel="log10(d5 = tau / s)", ylabel="log10(d1 / s)", title="The designs: d1 against d5, labelled with the shots that used them")
 </script>
 
+<script type="text/plain" class="example" id="ex-bayes-hp" data-group="Relaxation (spynach)" data-title="Adaptive Bayesian design for one hyperpolarised decay: waits and flip angles, forward only">
+import numpy as np
+from scipy.linalg import expm
+import spynach
+
+# --- The sample: one hyperpolarised spin, how it relaxes and how it is read ---
+nucleus = "13C"  # GUI: Nucleus | - | The hyperpolarised spin; in the rotating frame its gyromagnetic ratio does not enter | 13C, 15N, 1H, 129Xe
+T1_true = 40.0  # GUI: True T1 | s | The T1 that makes the data | 0.5..500
+snr = 200.0  # GUI: SNR | - | All of the hyperpolarised magnetisation read by one 90° pulse, over the noise of one acquisition | 5..5000
+B1_true = 1.0  # GUI: True B1 scale | - | Actual over nominal flip angle, the same for every pulse of the run in detail | 0.7..1.3
+offset = 0.0  # GUI: Resonance offset | kHz | Of the line from the carrier, during the hard pulses; the model assumes pulses on resonance | -50..50
+p90 = 20.0  # GUI: 90° pulse length | µs | Hard pulses, the flip angle set by the pulse length | 1..200
+thermal = 0.0  # GUI: Thermal polarisation | % | Equilibrium polarisation over the hyperpolarised one; the model assumes it is zero | 0..20
+seed = 3  # GUI: Noise seed | - | Another seed draws other noise, and other T1 values for the comparison | 1..100
+
+# --- What is known before, and what the design may choose ---
+T1_prior = 31.6  # GUI: Prior median T1 | s | Centre of the prior on T1 (its geometric mean) | 0.1..1000
+prior_width = 1.0  # GUI: Prior width | decades | Range of T1 that the prior spans: 1 is a factor of 10 | 0.1..3
+prior = "log-uniform"  # GUI: Prior shape | - | Log-uniform over that range, or lognormal with its ends two standard deviations from the median | log-uniform, lognormal
+B1_sd = 0.0  # GUI: B1 calibration | % | Standard deviation of the prior on the B1 scale, centred on 1. 0 treats B1 as known, so a true scale away from 1 becomes a model error | 0..20
+TR = 1.0  # GUI: Shortest interval | s | Between two pulses: the acquisition and the time to decide | 0.01..50
+t_max = 400.0  # GUI: Last pulse by | s | The run ends with a 90° pulse by this time at the latest | 10..10000
+flips = [1, 2, 3, 5, 8, 12, 20, 28, 40, 90]  # GUI: Flip angles | ° | The choices for each pulse, whole degrees. 90° reads all that is left and ends the run | 1..90
+waits = [1, 2, 4, 8, 16, 32]  # GUI: Spacings | intervals | The choices for the time between pulses, in shortest intervals | 1..1000
+n_runs = 20  # GUI: Runs per design | - | Monte Carlo runs that compare the designs, T1 (and an unknown B1 scale) drawn from the prior. 0 skips the comparison | 0..100
+
+# Forward-only adaptive design for one irreversible decay. A pulse of angle a reads
+# sin(a) of the z magnetisation and leaves cos(a) of it, so the run spends a budget: pulse k reads
+# w_k = sin^2(a_k) prod_{j<k} cos^2(a_j) of M^2, and the w_k add up to at most 1. With T1 known, the best use of it is
+# two pulses: 27.8° at t = 0, then 90° at 1.28 T1 (Bosch and Plenio's optimum). With T1 unknown, the
+# 90° must be timed by what the run has learnt, and learning spends budget.
+#
+# The data come from Spynach: hard pulses with the true B1 scale and offset, T1 relaxation towards thermal
+# equilibrium, a perfectly phased read, then a crusher. The inference assumes ideal pulses and zero equilibrium,
+#   y_k = A sin(s a_k) prod_{j<k} cos(s a_j) exp(-t_k / T1) + noise,
+# with the amplitude A marginalised exactly and T1 (and the B1 scale s, when it is not known) on a grid.
+#
+# Each decision is a receding-horizon plan, scored by the expected final variance of ln T1: the Cramer-Rao bound
+# averaged over the current posterior. The plans are (i) the 90° now or at one later time, or (ii) scouts of one
+# flip angle at one spacing, closed by a 90° that each posterior sample places at its own best time, missed by the
+# width the posterior will have by then (what the scouts before it teach). The best plan's first pulse is given, and
+# the plan is made again when the posterior has narrowed or moved, and at every pulse near the planned 90°. The
+# comparison runs the same Spynach sample through static designs optimised for the prior and through a simple
+# rule (20°, then 3° scouts until cashing in beats one more scout).
+if not TR < t_max:
+    raise ValueError("The shortest interval must be shorter than the run.")
+T1_lo, T1_hi = T1_prior / 10 ** (prior_width / 2), T1_prior * 10 ** (prior_width / 2)
+dt_fixed = max(TR, T1_lo / 20)  # the scout rule and the constant angle pulse no faster than every T1/20
+rng = np.random.default_rng(seed)
+known_B1 = B1_sd <= 0
+s_sd = B1_sd / 100
+choice = np.radians(sorted(set(float(a) for a in flips) | {90.0}))  # 90° always closes the run
+if not (choice < np.pi / 2 - 1e-9).any():  # a 90° alone learns nothing about T1
+    print("The flip angles have none below 90°, so 28° is added.\n")
+    choice = np.radians([28.0, 90.0])
+scouts = choice[choice < np.pi / 2 - 1e-9]
+steps = np.array(sorted(set(int(round(w)) for w in waits if w >= 1)) or [1])
+CLOSE = np.pi / 2
+
+
+def dense(m):
+    return m.toarray() if hasattr(m, "toarray") else np.asarray(m)
+
+
+# --- The spin in Spynach: Liouville space, T1 relaxation (scaled by 1/T1 below), the pulse and the coil ---
+ss = spynach.create({"isotopes": [nucleus], "magnet": 9.4}, {"zeeman": {"scalar": [0.0]}, "relaxation": ["t1_t2"], "r1_rates": [1.0],
+                                                              "r2_rates": [1.0], "equilibrium": "zero", "rlx_keep": "labframe"})
+ss = spynach.basis(ss, {"formalism": "sphten-liouv", "approximation": "none"})
+R_unit = dense(spynach.relaxation(ss))
+Lz_op, Ly_op = (dense(spynach.operator(ss, name, nucleus)) for name in ("Lz", "Ly"))
+rho_hp = dense(spynach.state(ss, "Lz", nucleus)).ravel()
+coil = dense(spynach.state(ss, "L+", nucleus)).ravel()
+full_read = abs(np.vdot(coil, dense(spynach.state(ss, "Lx", nucleus)).ravel()))  # what a 90° pulse reads from rho_hp
+z_norm = np.vdot(rho_hp, rho_hp).real
+w1 = np.pi / 2 / (p90 * 1e-6)  # nominal nutation rate, rad/s
+pulses = {}
+
+
+def pulse_propagator(flip, B1):
+    """Hard pulse of nominal angle flip (rad) about y at the B1 scale B1 and the offset; relaxation during its
+    microseconds is left out"""
+    if (flip, B1) not in pulses:
+        pulses[flip, B1] = expm(-1j * (2 * np.pi * offset * 1e3 * Lz_op + B1 * w1 * Ly_op) * flip / w1)
+    return pulses[flip, B1]
+
+
+def new_sample(T1, B1):
+    return {"R": R_unit / T1, "B1": B1, "rho": rho_hp.copy(), "t": 0.0}
+
+
+def fire(sample, t, flip):
+    """Wait until t, give the pulse and read it: the true signal (full magnetisation read = 1) and the z left"""
+    eq = thermal / 100 * rho_hp
+    sample["rho"] = eq + expm(sample["R"] * (t - sample["t"])) @ (sample["rho"] - eq)
+    sample["t"] = t
+    rho = pulse_propagator(flip, sample["B1"]) @ sample["rho"]
+    read = abs(np.vdot(coil, rho)) / full_read
+    sample["rho"] = np.vdot(rho_hp, rho).real / z_norm * rho_hp  # the crusher leaves z only
+    return read, np.vdot(rho_hp, sample["rho"]).real / z_norm
+
+
+def measure(T1, B1, times, angles):
+    """A fixed list of pulses on a fresh sample: the noisy reads"""
+    sample = new_sample(T1, B1)
+    true = np.array([fire(sample, t, a)[0] for t, a in zip(times, angles)])
+    return true + rng.standard_normal(len(true)) / snr
+
+
+# --- The model and the posterior, on a grid of ln(1/T1) (and of s) ---
+lnR_lo, lnR_hi = np.log(1 / T1_hi), np.log(1 / T1_lo)
+mid, spread = (lnR_lo + lnR_hi) / 2, (lnR_hi - lnR_lo) / 4
+n_lnR = 240 if known_B1 else 160  # with B1 unknown the grid is two-dimensional
+base_axes = (np.linspace(lnR_lo, lnR_hi, n_lnR) if prior == "log-uniform" else np.linspace(mid - 4 * spread, mid + 4 * spread, n_lnR),
+             np.array([1.0]) if known_B1 else np.linspace(max(0.3, 1 - 4 * s_sd), 1 + 4 * s_sd, 15))
+
+
+def log_prior(lnR, s):
+    lp = -0.5 * ((lnR - mid) / spread) ** 2 if prior == "lognormal" else np.where((lnR >= lnR_lo - 1e-9) & (lnR <= lnR_hi + 1e-9), 0.0, -np.inf)
+    return lp if known_B1 else lp - 0.5 * ((s - 1) / s_sd) ** 2
+
+
+def model(R, s, times, angles):
+    """Signal per unit amplitude: sin(s a_k) prod_{j<k} cos(s a_j) exp(-R t_k), one row per (R, s)"""
+    sa = s[:, None] * angles[None, :]
+    before = np.cumprod(np.concatenate([np.ones((len(s), 1)), np.cos(sa[:, :-1])], axis=1), axis=1)
+    return np.sin(sa) * before * np.exp(-R[:, None] * times[None, :])
+
+
+def posterior(times, angles, y, axes=base_axes, depth=0):
+    """Grid posterior from all data so far, A marginalised (flat prior); a finer grid when the posterior is narrow"""
+    lnR, s = (m.ravel() for m in np.meshgrid(*axes, indexing="ij"))
+    lp = log_prior(lnR, s)
+    if len(y):
+        F = model(np.exp(lnR), s, np.asarray(times, float), np.asarray(angles, float))
+        ff = np.maximum((F * F).sum(axis=1), 1e-300)
+        lp = lp - 0.5 * snr**2 * (y @ y - (F @ y) ** 2 / ff) - 0.5 * np.log(ff)
+    w = np.exp(lp - lp.max())
+    post = {"lnR": lnR, "s": s, "w": w / w.sum(), "axes": axes}
+    new, finer = [], False
+    for x, axis, base in ((lnR, axes[0], base_axes[0]), (s, axes[1], base_axes[1])):
+        mean = post["w"] @ x
+        sd = np.sqrt(max(post["w"] @ (x - mean) ** 2, 0.0))
+        step = axis[1] - axis[0] if len(axis) > 1 else np.inf
+        finer |= bool(len(axis) > 1 and sd < 2 * step and depth < 3)
+        new.append(np.linspace(max(base[0], mean - 8 * sd - step), min(base[-1], mean + 8 * sd + step), len(axis)) if len(axis) > 1 and sd < 2 * step else axis)
+    return posterior(times, angles, y, tuple(new), depth + 1) if finer else post
+
+
+def summary(post):
+    """Posterior mean and standard deviation of ln T1, its 95% interval in T1, and the mean and sd of s"""
+    x, w = -post["lnR"], post["w"]
+    mean = w @ x
+    order = np.argsort(x)
+    cdf = np.cumsum(w[order])
+    lo, hi = x[order][np.searchsorted(cdf, 0.025)], x[order][min(np.searchsorted(cdf, 0.975), len(x) - 1)]
+    s_mean = w @ post["s"]
+    return {"lnT1": mean, "sd": np.sqrt(w @ (x - mean) ** 2), "lo": np.exp(lo), "hi": np.exp(hi), "s": s_mean, "s_sd": np.sqrt(w @ (post["s"] - s_mean) ** 2)}
+
+
+def samples(post, n):
+    """n equal-weight samples (R, s) of a posterior"""
+    pick = np.minimum(np.searchsorted(np.cumsum(post["w"]), (np.arange(n) + 0.5) / n), len(post["w"]) - 1)
+    return np.exp(post["lnR"][pick]), post["s"][pick]
+
+
+# --- Fisher information of a design, in the order (A, R[, s]); the amplitude and s are profiled out ---
+def inverse_RR(m00, m01, m11, m02=None, m12=None, m22=None):
+    """[M^-1]_RR from the entries of symmetric Fisher matrices; inf where singular"""
+    if m22 is None:
+        det, cof = m00 * m11 - m01**2, m00
+    else:
+        cof = m00 * m22 - m02**2
+        det = m00 * (m11 * m22 - m12**2) - m01 * (m01 * m22 - m12 * m02) + m02 * (m01 * m12 - m11 * m02)
+    ok = det > 1e-12 * np.abs(cof) * np.abs(m11) + 1e-300
+    return np.where(ok, cof / np.where(ok, det, 1.0), np.inf)
+
+
+def entries(M):
+    return [M[..., 0, 0], M[..., 0, 1], M[..., 1, 1]] + ([] if known_B1 else [M[..., 0, 2], M[..., 1, 2], M[..., 2, 2]])
+
+
+def gradients(R, s, times, angles):
+    """d(signal)/d(A, R[, s]) of designs: times and angles (..., pulses), for the samples (R, s) on a new first axis;
+    also prod cos(s a) and sum a tan(s a) over all the pulses, which the next pulse inherits"""
+    T, A = np.asarray(times, float), np.asarray(angles, float)
+    sh = (slice(None),) + (None,) * T.ndim
+    sa = s[sh] * A[None]
+    c = np.cos(sa)
+    c = np.where(np.abs(c) < 1e-12, 1e-12, c)
+    surv = np.cumprod(np.concatenate([np.ones(sa.shape[:-1] + (1,)), c[..., :-1]], axis=-1), axis=-1)
+    tans = np.cumsum(np.concatenate([np.zeros(sa.shape[:-1] + (1,)), (A[None] * np.tan(sa))[..., :-1]], axis=-1), axis=-1)
+    f = np.sin(sa) * surv * np.exp(-R[sh] * T[None])
+    cot = np.where(A[None] > 0, A[None] / np.tan(np.where(A[None] > 0, sa, 1.0)), 0.0)  # a 0° placeholder reads nothing
+    g = np.stack([f, -T[None] * f, f * (cot - tans)], axis=-1)
+    return (g[..., :2] if known_B1 else g), surv[..., -1] * c[..., -1], tans[..., -1] + (A[None] * np.tan(sa))[..., -1]
+
+
+def fisher(g):
+    M = snr**2 * np.einsum("...ki,...kj->...ij", g, g)
+    if not known_B1:
+        M[..., 2, 2] += 1 / s_sd**2
+    return M
+
+
+def expected_var(R, s, times, angles, w=None):
+    """Expected final variance of ln T1 of designs (..., pulses): the Cramer-Rao bound averaged over samples (R, s)
+    with weights w (equal if None)"""
+    V = inverse_RR(*entries(fisher(gradients(R, s, times, angles)[0]))) / R[(slice(None),) + (None,) * (np.ndim(times) - 1)] ** 2
+    w = np.full(len(R), 1 / len(R)) if w is None else w / w.sum()
+    return np.tensordot(w, V, axes=1)
+
+
+# --- The decision: a receding-horizon plan ---
+GH_NODES, GH_WEIGHTS = np.polynomial.hermite.hermgauss(5)
+
+
+def plans(R, s, M_past, P0, T0, sd_now, t0, max_slots=150):
+    """Every plan of scouts, flip a every w intervals with the first at t0 + (w - 1) TR, closed by the 90°. Each
+    sample closes at its own best slot, missed by the posterior width that the scouts before it leave (Gauss-Hermite
+    over that error). Returns the expected final variance of ln T1, the flip, the spacing and the planned 90° of
+    every plan. R, s (n,) samples; M_past (n, d, d), P0 (n,) = prod cos and T0 (n,) = sum a tan of the past"""
+    a = np.repeat(scouts, len(steps))
+    D = TR * np.tile(steps, len(scouts))
+    start = t0 + D - TR
+    J = np.clip(np.floor((t_max - start) / D).astype(int) + 1, 0, max_slots)
+    j = np.arange(max(int(J.max()), 1))
+    tj = start[:, None] + D[:, None] * j[None, :]  # (plans, slots)
+    sa = s[:, None] * a[None, :]
+    kept = np.exp(j[None, None, :] * np.log(np.maximum(np.cos(sa) ** 2, 1e-300))[:, :, None])  # (prod cos)^2 of the scouts before slot j
+    f2 = (np.sin(sa) * P0[:, None])[:, :, None] ** 2 * kept * np.exp(-2 * R[:, None, None] * tj[None])
+    f90 = (np.sin(s * CLOSE) * P0)[:, None, None] ** 2 * kept * np.exp(-2 * R[:, None, None] * tj[None])
+
+    def before(x):  # sum over the scouts before slot j
+        return np.concatenate([np.zeros(x.shape[:-1] + (1,)), np.cumsum(x, axis=-1)[..., :-1]], axis=-1)
+
+    k2, past = snr**2, [m[:, None, None] for m in entries(M_past)]
+    scout = [before(f2), -before(tj[None] * f2), before(tj[None] ** 2 * f2)]
+    closing = [f90, -tj[None] * f90, tj[None] ** 2 * f90]
+    if not known_B1:
+        gam = (a[None, :] * np.tan(sa))[:, :, None]
+        h = (a[None, :] / np.tan(sa) - T0[:, None])[:, :, None] - j[None, None, :] * gam
+        h90 = (CLOSE / np.tan(s * CLOSE) - T0)[:, None, None] - j[None, None, :] * gam
+        scout += [before(h * f2), -before(tj[None] * h * f2), before(h * h * f2)]
+        closing += [h90 * f90, -tj[None] * h90 * f90, h90**2 * f90]
+    with_scouts = [p + k2 * sc for p, sc in zip(past, scout)]
+    crb = inverse_RR(*[w + k2 * cl for w, cl in zip(with_scouts, closing)]) / R[:, None, None] ** 2
+    ell = np.log(np.maximum(np.where((j[None, :] < J[:, None])[None], crb, np.inf), 1e-300))
+    best = np.argmin(ell, axis=2)  # (samples, plans): each sample's own best slot
+    J_scouts = 1 / np.take_along_axis(inverse_RR(*with_scouts), best[..., None], axis=2)[..., 0]
+    J_past = 1 / inverse_RR(*entries(M_past))
+    sig = 1 / np.sqrt(1 / sd_now**2 + R[:, None] ** 2 * np.maximum(np.nan_to_num(J_scouts) - np.nan_to_num(J_past)[:, None], 0.0))
+    t_best = np.take_along_axis(np.broadcast_to(tj[None], ell.shape), best[..., None], axis=2)[..., 0]
+    expected = 0.0
+    for node, weight in zip(GH_NODES, GH_WEIGHTS):  # the 90° at t_best exp(-delta) instead of t_best
+        q = np.clip((t_best * np.exp(-np.sqrt(2) * node * sig) - start[None]) / D[None], 0, np.maximum(J - 1, 0)[None])
+        i0 = np.minimum(np.floor(q).astype(int), np.maximum(J - 2, 0)[None])
+        lo = np.take_along_axis(ell, i0[..., None], axis=2)[..., 0]
+        hi = np.take_along_axis(ell, np.minimum(i0 + 1, np.maximum(J - 1, 0)[None])[..., None], axis=2)[..., 0]
+        finite = np.isfinite(lo) & np.isfinite(hi)  # a plan with no slot to close in scores inf
+        expected = expected + weight / np.sqrt(np.pi) * np.exp(np.where(finite, lo + (q - i0) * (np.where(finite, hi, 0) - np.where(finite, lo, 0)), np.inf))
+    return np.mean(expected, axis=0), a, D, np.exp(np.mean(np.log(t_best), axis=0))
+
+
+def close_at(R, s, times, angles, earliest, n_t=160):
+    """The 90° at one time for all samples: the best time from earliest on, and its expected final variance"""
+    tt = np.linspace(earliest, max(earliest, t_max), n_t)
+    V = expected_var(R, s, np.column_stack([np.tile(times, (n_t, 1)), tt]), np.tile([*angles, CLOSE], (n_t, 1)))
+    k = int(np.argmin(V))
+    return V[k], tt[k]
+
+
+first_decision = {}
+
+
+def decide(post, times, angles, clock, n=12):
+    """The best plan from now on: the next pulse (time, flip), its score and the plan it starts"""
+    if not times and first_decision:  # the first decision depends on the prior alone
+        return first_decision["made"]
+    R, s = samples(post, n)
+    sd_now = max(summary(post)["sd"], 1e-6)
+    options = []
+    if not times:  # the first pulse at t = 0: each flip, with its best plan after it
+        for a0 in scouts:
+            g, P0, T0 = gradients(R, s, [0.0], [a0])
+            V, a, D, tp = plans(R, s, fisher(g), P0, T0, sd_now, TR)
+            k = int(np.argmin(V))
+            options.append((V[k], 0.0, a0, {"scout": a[k], "every": D[k], "close": tp[k]}))
+    else:
+        earliest = max(clock, times[-1] + TR)
+        if earliest > t_max + 1e-9:
+            return None
+        V_close, t_close = close_at(R, s, times, angles, earliest)
+        options.append((V_close, t_close, CLOSE, {"scout": 0.0, "every": 0.0, "close": t_close}))
+        g, P0, T0 = gradients(R, s, times, angles)
+        V, a, D, tp = plans(R, s, fisher(g), P0, T0, sd_now, earliest)
+        k = int(np.argmin(V))
+        options.append((V[k], earliest + D[k] - TR, a[k], {"scout": a[k], "every": D[k], "close": tp[k]}))
+    score, t_next, a_next, plan = min(options, key=lambda o: o[0])
+    if times and t_close <= earliest + TR + 1e-9 and V_close <= 1.01 * score:  # closing at once is within 1% of the best: close
+        score, t_next, a_next, plan = options[0]
+    if not times:
+        first_decision["made"] = (t_next, a_next, score, plan)
+    return t_next, a_next, score, plan
+
+
+def adaptive(T1, B1, record=False):
+    """One forward-only run. A plan is followed while the posterior stays close to the one it was made for; it is
+    made again when the posterior has narrowed or moved, and at every pulse near the planned 90°"""
+    sample, times, angles, y, trace = new_sample(T1, B1), [], [], [], []
+    post, clock, plan, made = posterior([], [], np.array([])), 0.0, None, None
+    while True:
+        now = summary(post)
+        follow = (plan is not None and plan["scout"] > 0 and now["sd"] > 0.85 * made["sd"] and abs(now["lnT1"] - made["lnT1"]) < 0.5 * made["sd"]
+                  and times[-1] + 3 * plan["every"] < plan["close"] and times[-1] + plan["every"] <= t_max)
+        if follow:
+            t, a = times[-1] + plan["every"], plan["scout"]
+        else:
+            step = decide(post, times, angles, clock)
+            if step is None:
+                break
+            t, a, _, plan = step
+            made = now
+        clock = t
+        read, left = fire(sample, t, a)
+        times.append(t)
+        angles.append(a)
+        y.append(read + rng.standard_normal() / snr)
+        post = posterior(times, angles, np.array(y))
+        if record:
+            trace.append({"t": t, "a": a, "y": y[-1], "left": left, "plan": plan["close"], "replanned": not follow, **summary(post)})
+        if a >= CLOSE - 1e-9:
+            break
+    return np.array(times), np.array(angles), np.array(y), post, trace
+
+
+def scout_rule(T1, B1, a_first=np.radians(20.0), a_scout=np.radians(3.0)):
+    """A simple rule: 20° at t = 0, then a 3° scout every dt_fixed until cashing in now beats one more scout followed
+    by the 90°. Its decisions use a running posterior on the starting grid, the estimate the full one"""
+    lnR, s = (m.ravel() for m in np.meshgrid(*base_axes, indexing="ij"))
+    R_cells, lp0 = np.exp(lnR), log_prior(lnR, s)
+    ff, fy, yy, surv = np.zeros(len(s)), np.zeros(len(s)), 0.0, np.ones(len(s))
+    sample, times, angles, y = new_sample(T1, B1), [], [], []
+    for t in np.arange(0, t_max + 1e-9, dt_fixed):
+        if not times:
+            a = a_first
+        else:
+            lp = lp0 - 0.5 * snr**2 * (yy - fy**2 / np.maximum(ff, 1e-300)) - 0.5 * np.log(np.maximum(ff, 1e-300))
+            w = np.exp(lp - lp.max())
+            pick = np.minimum(np.searchsorted(np.cumsum(w / w.sum()), (np.arange(40) + 0.5) / 40), len(w) - 1)
+            now, later = expected_var(R_cells[pick], s[pick], [[*times, t, t], [*times, t, t + dt_fixed]], [[*angles, 0.0, CLOSE], [*angles, a_scout, CLOSE]])
+            a = CLOSE if (now <= later or t + dt_fixed > t_max) else a_scout
+        read, _ = fire(sample, t, a)
+        times.append(t)
+        angles.append(a)
+        y.append(read + rng.standard_normal() / snr)
+        f = np.sin(s * a) * surv * np.exp(-R_cells * t)
+        ff, fy, yy, surv = ff + f * f, fy + f * y[-1], yy + y[-1] ** 2, surv * np.cos(s * a)
+        if a >= CLOSE - 1e-9:
+            break
+    return posterior(times, angles, np.array(y))
+
+
+# --- The static designs, optimised for the prior: with T1 known, a at t = 0 and the 90° at u T1 ---
+a_grid, u_grid = np.radians(np.linspace(1, 89, 881))[:, None], np.linspace(0.05, 4, 800)[None, :]
+two = (1 / np.sin(a_grid) ** 2 + np.exp(2 * u_grid) / np.cos(a_grid) ** 2) / u_grid**2  # Var(ln T1) SNR^2 of that pair
+ia, iu = np.unravel_index(np.argmin(two), two.shape)
+a_opt, u_opt, oracle = a_grid[ia, 0], u_grid[0, iu], np.sqrt(two[ia, iu]) / snr
+prior_lnR = np.linspace(*((lnR_lo, lnR_hi) if prior == "log-uniform" else (mid - 2.5 * spread, mid + 2.5 * spread)), 48)
+s_points = np.array([1.0]) if known_B1 else 1 + s_sd * np.array([-1.5, -0.7, 0, 0.7, 1.5])
+Rp, sp = np.exp(np.repeat(prior_lnR, len(s_points))), np.tile(s_points, 48)
+wp = (np.ones(len(Rp)) if prior == "log-uniform" else np.exp(-0.5 * ((np.log(Rp) - mid) / spread) ** 2)) * np.exp(-0.5 * ((sp - 1) / max(s_sd, 1e-12)) ** 2)
+taus = np.geomspace(TR, t_max, 160)
+robust = min(((v, a, tau) for a in np.radians(np.arange(5, 61, 2.5))
+              for v, tau in zip(expected_var(Rp, sp, np.column_stack([np.zeros(len(taus)), taus]), np.tile([a, CLOSE], (len(taus), 1)), wp), taus)),
+             key=lambda v: v[0])
+const_times = np.arange(0, min(t_max, 4 * T1_hi) + 1e-9, dt_fixed)
+const_flips = np.radians(np.unique(np.concatenate([np.linspace(0.5, 30, 60), np.asarray(flips, float)])))
+const_flips = const_flips[const_flips < CLOSE]
+const = const_flips[int(np.argmin([expected_var(Rp, sp, const_times, np.full(len(const_times), a), wp) for a in const_flips]))]
+designs = {"two-shot at the prior's centre": (np.array([0, u_opt / np.exp(mid)]), np.array([a_opt, CLOSE])),
+           "two-shot, prior-robust": (np.array([0, robust[2]]), np.array([robust[1], CLOSE])),
+           f"constant {np.degrees(const):.1f}° every {dt_fixed:.3g} s": (const_times, np.full(len(const_times), const))}
+
+# --- The run in detail, at the true T1 and B1 ---
+times, angles, y, post, trace = adaptive(T1_true, B1_true, record=True)
+final = summary(post)
+print(f"Hyperpolarised {nucleus}: true T1 = {T1_true:g} s, B1 scale {B1_true:g}" + (" (known as 1)" if known_B1 else f" (prior 1 ± {B1_sd:g}%)")
+      + f", SNR {snr:g}, prior on T1 {prior} from {T1_lo:.3g} to {T1_hi:.3g} s; pulses at least {TR:g} s apart, the last by {t_max:g} s")
+print(f"best two-shot with T1 known: {np.degrees(a_opt):.1f}° at t = 0, then 90° at {u_opt:.4f} T1 = {u_opt * T1_true:.1f} s; "
+      f"sd(ln T1) = {100 * oracle:.2f}% (the oracle)")
+print(f"\n{'shot':>4} {'time (s)':>9} {'flip (°)':>8} {'signal':>8} {'z left':>7}   {'T1 estimate (s)':>22}{'' if known_B1 else '   B1 scale':>11}   {'90° planned at (s)':>18}")
+for k, e in enumerate(trace):
+    if k < 4 or (k + 1) % 5 == 0 or k == len(trace) - 1:
+        b1 = "" if known_B1 else f"   {e['s']:8.3f}"
+        print(f"{k + 1:4d} {e['t']:9.2f} {np.degrees(e['a']):8.1f} {e['y']:8.4f} {e['left']:7.3f}   {np.exp(e['lnT1']):10.3f} ± {100 * e['sd']:5.2f}%{b1}   {e['plan']:18.2f}")
+w_read = np.sin(B1_true * angles) ** 2 * np.cumprod(np.concatenate([[1.0], np.cos(B1_true * angles[:-1]) ** 2]))
+print(f"\nadaptive: T1 = {np.exp(final['lnT1']):.4g} s (95% {final['lo']:.4g} to {final['hi']:.4g}, true {T1_true:g}), sd(ln T1) {100 * final['sd']:.2f}% "
+      f"= {(final['sd'] / oracle) ** 2:.2f} times the oracle's variance; {len(times)} pulses, the 90° at {times[-1]:.1f} s = {times[-1] / T1_true:.2f} T1; "
+      f"of M², {100 * w_read[0]:.1f}% read by the first pulse, {100 * w_read[1:-1].sum():.1f}% by {max(len(times) - 2, 0)} scouts, {100 * w_read[-1]:.1f}% by the 90°"
+      + ("" if known_B1 else f"; B1 scale {final['s']:.3f} ± {final['s_sd']:.3f} (true {B1_true:g})"))
+static = {}
+for name, (t_d, a_d) in designs.items():
+    static[name] = posterior(t_d, a_d, measure(T1_true, B1_true, t_d, a_d))
+    sm = summary(static[name])
+    print(f"{name} ({len(t_d)} pulses{f', {np.degrees(a_d[0]):.1f}° at 0 and 90° at {t_d[1]:.1f} s' if len(t_d) == 2 else ''}): "
+          f"T1 = {np.exp(sm['lnT1']):.4g} s (95% {sm['lo']:.4g} to {sm['hi']:.4g}), sd(ln T1) {100 * sm['sd']:.2f}%")
+
+# --- The pulses of the run, at their times and flip angles, labelled with the shot number ---
+show_points([{"name": "adaptive", "x": times, "y": np.log10(np.degrees(angles)),
+              "labels": [str(k + 1) if k < 3 or (k + 1) % 10 == 0 or k == len(times) - 1 else "" for k in range(len(times))],
+              "hover": [f"shot {k + 1}: {np.degrees(a):.1f}° at {t:.2f} s, read {yk:.4f}" for k, (t, a, yk) in enumerate(zip(times, angles, y))]}]
+            + [{"name": name, "x": t_d, "y": np.log10(np.degrees(a_d)), "hover": [f"{name}: {np.degrees(a):.1f}° at {t:.2f} s" for t, a in zip(t_d, a_d)]}
+               for name, (t_d, a_d) in designs.items() if len(t_d) == 2],
+            xlabel="time (s)", ylabel="log10(flip angle / °)", title=f"The pulses of the run, numbered; the 90° closes it at {times[-1] / T1_true:.2f} T1")
+
+# --- The polarisation budget: z magnetisation left, and the share of M^2 read so far ---
+t_axis = np.linspace(0, max(times[-1], T1_true) * 1.15, 1200)
+k_of = np.searchsorted(times, t_axis, side="right") - 1
+eq = thermal / 100
+left = np.where(k_of < 0, 1.0, np.array([e["left"] for e in trace])[np.maximum(k_of, 0)])
+since = t_axis - np.where(k_of < 0, 0.0, times[np.maximum(k_of, 0)])
+show_spectrum([eq + (left - eq) * np.exp(-since / T1_true), eq + (1 - eq) * np.exp(-t_axis / T1_true), np.where(k_of < 0, 0.0, np.cumsum(w_read)[np.maximum(k_of, 0)])],
+              t_axis, invert=False, names=["z magnetisation left", "without pulses", "share of M² read"], xlabel="time (s)",
+              ylabel="fraction of the hyperpolarised value", title="The budget: each pulse reads sin² of what is left and keeps cos²")
+
+# --- How the estimate and the plan settle, shot by shot ---
+shots = np.arange(1, len(trace) + 1)
+show_spectrum([np.log10([np.exp(e["lnT1"]) for e in trace]), np.log10([e["lo"] for e in trace]), np.log10([e["hi"] for e in trace]),
+               np.full(len(shots), np.log10(T1_true))], shots, invert=False, names=["posterior mean", "95% low", "95% high", "true T1"],
+              xlabel="shot", ylabel="log10(T1 / s)", title=f"T1 after every pulse: {np.exp(final['lnT1']):.4g} s at the end (true {T1_true:g} s)")
+show_spectrum([[e["plan"] for e in trace], [e["t"] for e in trace], np.full(len(shots), u_opt * T1_true)], shots, invert=False,
+              names=["planned time of the 90°", "time of this pulse", f"{u_opt:.2f} T1, best with T1 known"], xlabel="shot", ylabel="time (s)",
+              title="The plan: where the closing 90° would go, made again whenever the posterior has changed")
+if not known_B1:
+    show_spectrum([[e["s"] for e in trace], [e["s"] - 2 * e["s_sd"] for e in trace], [e["s"] + 2 * e["s_sd"] for e in trace], np.full(len(shots), B1_true)],
+                  shots, invert=False, names=["posterior mean", "−2 sd", "+2 sd", "true B1 scale"], xlabel="shot", ylabel="B1 scale",
+                  title="The B1 scale after every pulse: only flip angles that differ make it identifiable")
+
+# --- Posterior of T1 at the end of each design ---
+x = np.linspace(np.log10(T1_lo) - 0.3, np.log10(T1_hi) + 0.3, 1500)
+
+
+def density(p):
+    n_s = len(p["axes"][1])  # the marginal over s
+    lnT1, w = -p["lnR"].reshape(-1, n_s)[::-1, 0], p["w"].reshape(-1, n_s).sum(axis=1)[::-1]  # T1 rising
+    d = np.interp(x, lnT1 / np.log(10), w / ((lnT1[1] - lnT1[0]) / np.log(10)), left=0, right=0)
+    return d / max(d.max(), 1e-300)
+
+
+show_spectrum([density(posterior([], [], np.array([]))), density(post)] + [density(p) for p in static.values()], x, invert=False,
+              names=["prior", "adaptive"] + list(static), xlabel="log10(T1 / s)", ylabel="posterior (peak = 1)",
+              title=f"Posterior of T1 at the end of each design (true {T1_true:g} s)")
+
+# --- Monte Carlo: every design on the same draws of T1 (and of an unknown B1 scale) from the prior ---
+if n_runs > 0:
+    draws = np.exp(-(rng.uniform(lnR_lo, lnR_hi, n_runs) if prior == "log-uniform" else rng.normal(mid, spread, n_runs)))
+    B1s = np.full(n_runs, B1_true) if known_B1 else 1 + s_sd * rng.standard_normal(n_runs)
+    names = ["adaptive", "20°, then 3° scouts", *designs]
+    errors, post_var = ({name: [] for name in names} for _ in range(2))
+    cash, n_pulses = [], []
+    for T1, B1 in zip(draws, B1s):
+        t_a, _, _, p_a, _ = adaptive(T1, B1)
+        cash.append(t_a[-1] / T1)
+        n_pulses.append(len(t_a))
+        ends = {"adaptive": p_a, names[1]: scout_rule(T1, B1)}
+        ends.update({name: posterior(t_d, a_d, measure(T1, B1, t_d, a_d)) for name, (t_d, a_d) in designs.items()})
+        for name, p in ends.items():
+            sm = summary(p)
+            errors[name].append(sm["lnT1"] - np.log(T1))
+            post_var[name].append(sm["sd"] ** 2)
+    ratio = {name: np.mean(v) / oracle**2 for name, v in post_var.items()}
+    rmse = {name: np.sqrt(np.mean(np.square(e))) for name, e in errors.items()}
+    print(f"\n{n_runs} runs of every design, T1{'' if known_B1 else ' and the B1 scale'} drawn from the prior. Against the oracle's variance "
+          f"({100 * oracle:.2f}% in ln T1, T1 and B1 known): the mean posterior variance, and the squared RMSE of ln T1 (noisier: ± one standard error)")
+    for name in sorted(ratio, key=ratio.get):
+        e2 = np.square(errors[name])
+        print(f"  {name:36s} {ratio[name]:6.2f}   {(rmse[name] / oracle) ** 2:6.2f} ± {np.std(e2) / np.sqrt(len(e2)) / oracle**2:4.2f}   RMSE {100 * rmse[name]:5.2f}%"
+              + (f"; the 90° at {np.median(cash):.2f} T1 (IQR {np.percentile(cash, 25):.2f} to {np.percentile(cash, 75):.2f}), median {np.median(n_pulses):.0f} pulses"
+                 if name == "adaptive" else ""))
+    edge = np.linspace(0, 4 * max(rmse.values()), 400)
+    show_spectrum([np.mean(np.abs(np.array(errors[name]))[:, None] <= edge[None, :], axis=0) for name in names], 100 * edge, invert=False,
+                  names=[f"{name} ({ratio[name]:.2f})" for name in names], xlabel="|error of ln T1| (%)", ylabel="fraction of runs",
+                  title=f"{n_runs} runs from the prior: the share of runs within each error (mean posterior variance over the oracle's in the legend)")
+</script>
+
 <script type="text/plain" class="example" id="ex-powder-fine" data-group="NMR (spynach)" data-title="Powder CSA, 1600 orientations">
 import numpy as np
 import spynach

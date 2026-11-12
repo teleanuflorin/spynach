@@ -61,7 +61,15 @@ Releases are tagged `vX.Y.Z` on GitHub; the version is `spynach.__version__`.
   nearest the data, which can lie far from the truth, and the stated uncertainties stay calibrated. Both examples
   plot the estimates against the number of shots, and the designs used in the plane of d1 and d5 (tau), each
   labelled with the shots that used it, through the playground's new `show_points` (a scatter of labelled points
-  with a hover text per point).
+  with a hover text per point). `try.html#ex-bayes-hp` is forward-only design for one hyperpolarised decay, where
+  every pulse spends polarisation that cannot come back: it chooses the wait and the flip angle of each pulse by a
+  receding-horizon plan (scouts of one angle and spacing, closed by a 90° that each posterior sample times for
+  itself, missed by the width the scouts will have left), scored by the posterior-averaged Cramér-Rao bound on
+  ln T1. The data come from Spynach (hard pulses with a B1 scale and an offset, relaxation towards thermal
+  polarisation, a crusher after each read), the inference assumes ideal pulses, and the B1 scale can be a
+  nuisance with a calibration prior. Monte Carlo runs compare it with two-shot and constant-angle designs
+  optimised for the prior and with a fixed 3° scout rule: about 1.0 times the variance of the best design with T1
+  known, against 1.1 to 1.2 for the scout rule and 1.8 to 2.5 for the static designs.
 - Exact coefficients of the pathway expressions need a numerator of at most 10^4: a large float otherwise matched
   some fraction of large numerator by chance. Pathway operators carry an `info` text, shown on hover in the chord
   diagram. In the playground's line plots, a pixel column of many samples now ends at its last sample, which keeps
