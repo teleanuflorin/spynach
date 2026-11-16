@@ -1179,6 +1179,407 @@ show_spectrum(list(np.array(widths).T), np.log10(grid / 1e-12), invert=False, xl
               title="13C linewidths against the CF3 rotation time" + (f", without {switch_off}" if off else ""))
 </script>
 
+<script type="text/plain" class="example" id="ex-cf3-hsqcetgpsi" data-group="Relaxation (spynach)" data-title="19F-13C HSQC of 13CF3 as recorded (ADhsqcetgpsi_nodecpl): map and F1 traces">
+import logging
+
+import numpy as np
+import spynach
+
+# --- 13CF3 group of trifluoromethionine, with the rotation of the CF3 group about its C3 axis ---
+magnet = 14.0868  # GUI: Magnet field | T | 14.0868 T puts 19F at 564.57 MHz, as in the recorded data (a 600 MHz magnet) | 1..28
+tau_c = 50.0  # GUI: Tumbling time | ns | Isotropic rotational correlation time of the protein or the medium | 1..300
+rotation = "50 ps"  # GUI: CF3 rotation time | - | Correlation time of the rotation of the CF3 group about its C3 axis, on top of the tumbling; rigid switches the rotation off | 1 ps, 2 ps, 5 ps, 10 ps, 20 ps, 50 ps, 100 ps, 200 ps, 500 ps, 1 ns, 2 ns, 5 ns, 10 ns, 20 ns, 50 ns, 100 ns, rigid
+parameter_set = "methionine"  # GUI: Parameter set | - | methionine: Ac-L-trifluoromethionine-NH2 (M06/cc-pVDZ, GIAO, SMD water) with its DFT J matrix; cf3ch3: ORCA CF3-CH3 model, 1J(CF) = -280 Hz | methionine, cf3ch3
+symmetrise = True  # GUI: C3-symmetrise | - | Make the group exactly C3-symmetric (mean geometry, C3 images of the averaged 19F tensor); off uses each fluorine's own DFT tensor
+offset_19F = 0.0  # GUI: 19F offset | Hz | Of the CF3 line from the 19F carrier | -3000..3000
+offset_13C = 0.0  # GUI: 13C offset | Hz | Of the CF3 carbon from the 13C carrier | -500..500
+
+# --- The pulse program, ADhsqcetgpsi_nodecpl: Bruker's hsqcetgpsi (sensitivity improvement, echo-antiecho gradient
+# selection) without the 19F 180 in t1 and without 13C decoupling in acquisition, so both dimensions keep J(CF) ---
+refocus_t1 = False  # GUI: 19F 180 in t1 | - | Off as recorded (;(p2 ph7) commented out). On, as in Bruker's hsqcetgpsi, the 19F 180 in the middle of t1 removes the 19F coupling from F1
+decouple_f2 = False  # GUI: 13C decoupling in acquisition | - | Off as recorded (;cpd2:f2). On, as in Bruker's hsqcetgpsi, F2 shows a single 19F line
+cnst2 = 300.0  # GUI: J for d4 (cnst2) | Hz | J(CF) the INEPT delays are set for: d4 = 1/(4 cnst2) | 100..400
+d24 = 1.1  # GUI: Delay d24 | ms | Each of the two delays of the first transfer of the sensitivity improvement | 0.1..5
+sw_f2 = 6849.315  # GUI: SW F2 | Hz | 19F sweep width (12.1 ppm) | 1000..50000
+td_f2 = 1024  # GUI: TD F2 | - | 19F points, real and imaginary counted separately as in TopSpin (512 complex) | 64..8192
+sw_f1 = 1207.139  # GUI: SW F1 | Hz | 13C sweep width (8.0 ppm) | 300..20000
+td_f1 = 48  # GUI: TD F1 | - | 13C increments, echo and antiecho counted separately as in TopSpin (24 values of t1) | 4..1024
+lb_f2 = 10.0  # GUI: LB F2 | Hz | Exponential line broadening of the 19F dimension (WDW EM), as processed | 0..50
+window_f1 = "qsine 2"  # GUI: Window F1 | - | qsine 2 (a cosine squared, WDW QSINE with SSB 2) as processed, or none | qsine 2, none
+
+# Recorded pulses and delays (acqus of the CF3 dataset): 19F 90 p1, 13C 90 p3, gradients p16, recovery d16, pre-scan
+# delay de. Pulses are ideal and instantaneous at their centres; every delay between centres is free evolution under
+# the full Liouvillian (Redfield relaxation included), and each gradient is the coherence selection it makes
+# (gpz2/gpz1 = 21.4/80, the ratio of the gyromagnetic ratios of 13C and 19F)
+P1, P2, P3, P4 = 12.65e-6, 25.3e-6, 11.7e-6, 23.4e-6
+P16, D16, D0, DE = 1e-3, 200e-6, 3e-6, 18e-6
+U50, U4 = 50e-6, 4e-6  # the 50u UNBLKGRAD and the 4u on either side of the last gradient
+D4 = 1 / (4 * cnst2)
+DELTA = P16 + D16 + U50 + P2 + 2 * D0  # still counts the 180 that ;(p2 ph7) took out of t1
+DELTA1 = P16 + D16 - 0.78 * P1 + DE + 2 * U4
+variant = "standard hsqcetgpsi" if refocus_t1 and decouple_f2 else "as recorded" if not (refocus_t1 or decouple_f2) else \
+    "19F 180 in t1" if refocus_t1 else "13C decoupled in acquisition"
+
+# DFT geometry (Angstrom), absolute shielding tensors (ppm) and J couplings (Hz), spin order 13C, 19F, 19F, 19F
+SETS = {
+    "methionine": {
+        "xyz": [[3.838905, 1.223729, -1.548960], [4.869241, 0.989273, -0.731281],
+                [3.705455, 0.134089, -2.311492], [4.167605, 2.239385, -2.345536]],
+        "shielding": [[[66.98750, 1.82505, -10.66980], [1.82505, 37.12490, 8.00080], [-10.66980, 8.00080, 55.39780]],
+                      [[301.22010, -10.27180, 60.99020], [-10.27180, 223.81440, 9.72655], [60.99020, 9.72655, 192.60830]],
+                      [[198.65500, -23.66390, 18.89510], [-23.66390, 258.57760, 68.99430], [18.89510, 68.99430, 270.59840]],
+                      [[224.17350, 55.62785, -18.72120], [55.62785, 244.20260, -46.13885], [-18.72120, -46.13885, 278.11020]]],
+        "J_CF": [-265.112, -263.167, -238.771], "J_FF": [46.825, 74.669, 72.138],
+    },
+    "cf3ch3": {
+        "xyz": [[-3.36081140, -0.16562400, -0.38806991], [-3.63893407, 0.33115799, 0.83160365],
+                [-2.78190802, 0.83694385, -1.07465430], [-4.52055774, -0.45679680, -0.98671728]],
+        "shielding": [[[29.111, -18.781, -6.710], [-14.130, 30.020, -7.130], [-5.480, -9.218, 28.069]],
+                      [[176.067, 3.096, -93.670], [6.109, 210.556, 43.031], [-63.311, 56.747, 264.722]],
+                      [[131.428, 36.479, -12.172], [41.178, 266.458, -45.414], [-40.430, -62.639, 253.450]],
+                      [[303.627, 11.869, 44.387], [9.119, 140.737, -14.782], [43.673, -13.556, 227.950]]],
+        "J_CF": [-280.0] * 3, "J_FF": [0.0] * 3,
+    },
+}
+data = SETS[parameter_set]
+
+# The C3 frame: z from the carbon to the centroid of the fluorines, x along the first C-F bond (as in the 13CF3
+# TROSY example). The shift tensors are delta = -sigma, symmetrised and traceless, plus the chosen offsets
+xyz = np.array(data["xyz"])
+z = xyz[1:].mean(axis=0) - xyz[0]
+z /= np.linalg.norm(z)
+x = xyz[1] - xyz[0] - (xyz[1] - xyz[0]) @ z * z
+x /= np.linalg.norm(x)
+frame = np.array([x, np.cross(z, x), z])
+coords = (xyz - xyz[0]) @ frame.T
+shifts = []
+for sigma in np.array(data["shielding"]):
+    delta = frame @ (-(sigma + sigma.T) / 2) @ frame.T
+    shifts.append(delta - np.trace(delta) / 3 * np.eye(3))
+
+
+def rotz(angle):
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1.0]])
+
+
+if symmetrise:  # sites in order of azimuth; site j carries the C3 image of the averaged fluorine tensor
+    azimuth = np.arctan2(coords[1:, 1], coords[1:, 0])
+    sites = 1 + np.argsort(np.mod(azimuth - azimuth[0], 2 * np.pi))
+    turns = 2 * np.pi * np.arange(3) / 3
+    radius = np.linalg.norm(coords[1:], axis=1).mean()
+    theta = np.arccos(coords[1:, 2] / np.linalg.norm(coords[1:], axis=1)).mean()
+    fluorine = sum(rotz(-a) @ shifts[s] @ rotz(a) for s, a in zip(sites, turns)) / 3
+    shifts[0] = sum(rotz(a) @ shifts[0] @ rotz(-a) for a in turns) / 3
+    for s, a in zip(sites, turns):
+        shifts[s] = rotz(a) @ fluorine @ rotz(-a)
+        coords[s] = radius * np.array([np.sin(theta) * np.cos(azimuth[0] + a), np.sin(theta) * np.sin(azimuth[0] + a), np.cos(theta)])
+
+# The offsets as isotropic shifts (ppm of each nucleus' Larmor frequency)
+nu_19F, nu_13C = (spynach.isotopes.spin(n)[0] * magnet / (2 * np.pi) for n in ("19F", "13C"))
+shifts = [s + 1e6 * (offset_13C / nu_13C if k == 0 else offset_19F / nu_19F) * np.eye(3) for k, s in enumerate(shifts)]
+
+# CF3 rotation as diffusion about C3 on top of the tumbling (Woessner): D_par = D_perp + 1/tau_int
+tau_int = np.inf if rotation == "rigid" else float(rotation.split()[0]) * {"ps": 1e-12, "ns": 1e-9}[rotation.split()[1]]
+tumbling = [tau_c * 1e-9] if tau_int == np.inf else [1 / (1 / (tau_c * 1e-9) + 6 / tau_int), tau_c * 1e-9]
+J_CF, J_FF = np.mean(data["J_CF"]), np.mean(data["J_FF"])  # rotamer averages: the fluorines are equivalent
+cf3 = spynach.create(
+    {"isotopes": ["13C", "19F", "19F", "19F"], "magnet": magnet},
+    {"zeeman": {"matrix": [s.tolist() for s in shifts]}, "coordinates": coords.tolist(),
+     "coupling": {"scalar": [[0, J_CF, J_CF, J_CF], [0, 0, J_FF, J_FF], [0, 0, 0, J_FF], [0, 0, 0, 0]]},
+     "relaxation": ["redfield"], "rlx_keep": "secular", "equilibrium": "zero", "tau_c": [tumbling]},
+)
+cf3 = spynach.basis(cf3, {"formalism": "sphten-liouv", "approximation": "none"})
+logging.getLogger("spynach").setLevel(logging.ERROR)  # the Redfield integrals take long steps, as they should
+
+
+def dense(m):
+    return m.toarray() if hasattr(m, "toarray") else np.asarray(m)
+
+
+L = dense(spynach.hamiltonian(spynach.assume(cf3, "nmr"))) + 1j * dense(spynach.relaxation(cf3))
+
+# --- The sequence on Spynach's Liouville space: rho evolves as exp(-i L t) rho = V exp(-i lam t) V^-1 rho ---
+lam, V = np.linalg.eig(L)
+V_inv = np.linalg.inv(V)
+
+
+def free(t, rho):
+    """Free evolution for a time t (s) of a state or of a stack of states (columns), relaxation included"""
+    return V @ (np.exp(-1j * lam * t)[:, None] * (V_inv @ rho.reshape(len(lam), -1))).reshape(rho.shape)
+
+
+def op(name, isotope):
+    return dense(spynach.operator(cf3, name, isotope))
+
+
+Fx, Fy, Cx, Cy = op("Lx", "19F"), op("Ly", "19F"), op("Lx", "13C"), op("Ly", "13C")
+PHASES = {"x": 0, "y": 90, "-x": 180, "-y": 270}  # Bruker's ph 0 1 2 3
+pulses = {}
+
+
+def pulse(rho, angle, f=None, c=None):
+    """Ideal hard pulse of angle (degrees) with phase f on 19F and phase c on 13C; a channel left at None is not pulsed"""
+    key = (angle, f, c)
+    if key not in pulses:
+        axis = sum(np.cos(np.deg2rad(PHASES[ph])) * X + np.sin(np.deg2rad(PHASES[ph])) * Y
+                   for ph, X, Y in ((f, Fx, Fy), (c, Cx, Cy)) if ph is not None)
+        pulses[key] = dense(spynach.propagator(cf3, axis, np.deg2rad(angle)))
+    return pulses[key] @ rho
+
+
+def select(rho, orders):
+    """Analytic gradient: keep the coherence orders that the gradient pair refocuses, e.g. {"13C": -1, "19F": 0}"""
+    return spynach.coherence(cf3, rho.T, list(orders.items())).T
+
+
+def start():
+    """19F to 13C INEPT: the state at the start of t1. Each delay runs from the centre of one pulse to the next"""
+    rho = dense(spynach.state(cf3, "Lz", "19F")).ravel()
+    rho = pulse(rho, 90, f="x")                          # (p1 ph1)
+    rho = free(P1 / 2 + D4 + P2 / 2, rho)                # d4
+    rho = pulse(rho, 180, f="x", c="x")                  # (center (p2 ph1) (p4 ph6):f2)
+    rho = free(P2 / 2 + D4 + P1 / 2, rho)                # d4
+    return pulse(rho, 90, f="y", c="x")                  # (p1 ph2) (p3 ph3):f2, started together
+
+
+def t1_delays():
+    """The fixed delays on either side of the middle of t1, on top of t1/2 each: from the 13C 90 (p3 ph3), and on to
+    the 13C 180 after gp1 (d0, 50u, p16:gp1*EA, d16)"""
+    p2 = P2 if refocus_t1 else 0.0                       # the recorded sequence leaves 19F free in t1
+    return P1 - P3 / 2 + D0 + p2 / 2, p2 / 2 + D0 + U50 + P16 + D16 + P4 / 2
+
+
+def t1_period(rho, t1):
+    """States after t1 = 2 d0 for each value of t1 (columns): free for t1/2, the 19F 180 if it is in, free for t1/2"""
+    t_in, t_out = t1_delays()
+    half = V @ (np.exp(-1j * np.outer(lam, t_in + t1 / 2)) * (V_inv @ rho)[:, None])
+    if refocus_t1:
+        half = pulse(half, 180, f="x")                   # (p2 ph7), commented out in the recorded sequence
+    return V @ (np.exp(-1j * np.outer(lam, t_out + t1 / 2)) * (V_inv @ half))
+
+
+def after_t1(stack):
+    """Echo and antiecho, from the first gradient to the first point of the FID, for each column of stack"""
+    final = P2 / 2 + U4 + P16 + D16 + U4 + DE            # from the last 180 to the first point; DELTA1 matches it
+    out = {}
+    for name, (order, ph5) in {"echo": (-1, "y"), "antiecho": (+1, "-y")}.items():  # F1EA: gp1 x EA and ph5 + 180
+        s = select(stack, {"13C": order, "19F": 0})      # the 13C coherence order that gp1 x EA leaves for gp2 to refocus
+        s = pulse(s, 180, c="x")                         # (p4 ph4):f2
+        s = free(P4 / 2 + DELTA + P1 / 2, s)             # DELTA
+        s = pulse(s, 90, f="x", c="x")                   # (center (p1 ph1) (p3 ph4):f2)
+        s = free(P1 / 2 + d24 * 1e-3 + P2 / 2, s)        # d24
+        s = pulse(s, 180, f="x", c="x")                  # (center (p2 ph1) (p4 ph1):f2)
+        s = free(P2 / 2 + d24 * 1e-3 + P1 / 2, s)        # d24
+        s = pulse(s, 90, f="y", c=ph5)                   # (center (p1 ph2) (p3 ph5):f2)
+        s = free(P1 / 2 + D4 + P2 / 2, s)                # d4
+        s = pulse(s, 180, f="x", c="x")                  # (center (p2 ph1) (p4 ph1):f2)
+        s = free(P2 / 2 + D4 + P1 / 2, s)                # d4
+        s = pulse(s, 90, f="x")                          # (p1 ph1)
+        s = free(final, s)                               # DELTA1
+        s = pulse(s, 180, f="x")                         # (p2 ph1)
+        s = select(s, {"19F": +1, "13C": 0})             # p16:gp2: the 19F coherence the coil sees
+        out[name] = free(final, s)                       # 4u, p16:gp2, d16, 4u, de: the top of the echo
+    return out
+
+
+def scans(t1):
+    """Echo and antiecho states at the first point of the FID, (states, t1 values) each"""
+    return after_t1(t1_period(start(), t1))
+
+
+def acquire(stack, n_t2):
+    """FID of every column, (t2 points, columns), with the 19F coil; 13C decoupled if asked"""
+    coil = dense(spynach.state(cf3, "L+", "19F")).ravel()
+    if decouple_f2:
+        L_acq, both = spynach.decouple(cf3, L, np.column_stack([stack, coil]), ["13C"])
+        lam_a, V_a = np.linalg.eig(dense(L_acq))
+        amps = (both[:, -1].conj() @ V_a)[:, None] * np.linalg.solve(V_a, both[:, :-1])
+    else:
+        lam_a, amps = lam, (coil.conj() @ V)[:, None] * (V_inv @ stack)
+    t2 = np.arange(n_t2) / sw_f2
+    return np.exp(-1j * np.outer(t2, lam_a)) @ amps
+
+
+def f2_spectrum(fid, si):
+    """F2 processing of every column: WDW EM with lb_f2, Fourier transform zero-filled to si points (SI); FCOR 1"""
+    t2 = np.arange(fid.shape[0]) / sw_f2
+    return np.fft.fftshift(np.fft.fft(np.exp(-np.pi * lb_f2 * t2)[:, None] * fid, si, axis=0), axes=0)
+
+
+def phase_f2(f2):
+    """PHC0 of F2, the same for echo and antiecho (TopSpin phases every row before it combines them): set on the
+    tallest point of the first echo row. Returns the phased spectra and the phase (radians)"""
+    first = f2["echo"][:, 0]
+    phc0 = np.angle(first[np.argmax(np.abs(first))])
+    return {name: s * np.exp(-1j * phc0) for name, s in f2.items()}, phc0
+
+
+def f1_spectrum(f2_e, f2_a, window, si):
+    """Echo-antiecho combination (TopSpin's MC2 = EA) of F2-phased spectra into one complex t1 signal, the F1 window,
+    the first point halved (FCOR 0.5), and the Fourier transform zero-filled to si points (SI)"""
+    signal = f2_a + np.conj(f2_e)  # the antiecho evolves as exp(+i W t1) and the echo as exp(-i W t1)
+    n = signal.shape[-1]
+    if window == "qsine 2":  # QSINE with SSB = 2: sine bell squared shifted by pi/2, cos^2 from 1 to 0
+        signal = signal * np.cos(np.pi / 2 * np.arange(n) / n) ** 2
+    signal[..., 0] /= 2
+    return np.fft.fftshift(np.fft.fft(signal, si, axis=-1), axes=-1)
+
+
+def fold(f, sw):
+    """Where a frequency appears in a spectrum of sweep width sw around the carrier"""
+    return (f + sw / 2) % sw - sw / 2
+
+
+def peak(trace, axis, near, half=None):
+    """Index, height and full width at half height of the strongest point of trace within half of near"""
+    half = abs(J_CF) / 4 if half is None else half
+    idx = np.flatnonzero(np.abs(axis - near) <= half)
+    idx = idx if idx.size else np.array([np.argmin(np.abs(axis - near))])
+    k = idx[np.argmax(np.abs(trace[idx]))]
+    y = trace * (np.sign(trace[k]) or 1.0)
+    level, left, right = y[k] / 2, k, k
+    while left > 0 and y[left] > level:
+        left -= 1
+    while right < len(y) - 1 and y[right] > level:
+        right += 1
+
+    def edge(i, j):
+        return axis[i] if y[j] == y[i] else axis[i] + (level - y[i]) / (y[j] - y[i]) * (axis[j] - axis[i])
+
+    return k, trace[k], abs(edge(max(right - 1, 0), right) - edge(left, min(left + 1, len(y) - 1)))
+
+
+# --- The recorded experiment: TD 1024 x 48, then processed with SI 8192 x 1024 as in TopSpin ---
+n_t2, n_t1 = td_f2 // 2, td_f1 // 2
+fid = {name: acquire(s, n_t2) for name, s in scans(np.arange(n_t1) / sw_f1).items()}
+ax2 = np.fft.fftshift(np.fft.fftfreq(8192, 1 / sw_f2))  # Hz from the 19F carrier
+ax1 = np.fft.fftshift(np.fft.fftfreq(1024, 1 / sw_f1))  # Hz from the 13C carrier
+# The lines: 19F at offset - J m(13C) and 13C at offset - J M_F, M_F the total 19F z (as in the 13CF3 TROSY example)
+m_C = [0.0] if decouple_f2 else [0.5, -0.5]
+M_F = [0.0] if refocus_t1 else [1.5, 0.5, -0.5, -1.5]
+lines_f2 = [fold(offset_19F - J_CF * m, sw_f2) for m in m_C]
+lines_f1 = [fold(offset_13C - J_CF * m, sw_f1) for m in M_F]
+centre_f2, centre_f1 = fold(offset_19F, sw_f2), fold(offset_13C, sw_f1)
+keep = np.flatnonzero(np.abs(ax2 - centre_f2) <= abs(J_CF) + 250)  # the F2 window kept (at most 2048 points)
+keep = keep[:: max(1, len(keep) // 2048)]
+f2, phc0_f2 = phase_f2({name: f2_spectrum(f, 8192)[keep] for name, f in fid.items()})
+spec = f1_spectrum(f2["echo"], f2["antiecho"], window_f1, 1024)
+phc0_f1 = np.angle(spec.flat[np.argmax(np.abs(spec))])
+spec = (spec * np.exp(-1j * phc0_f1)).real  # PHC0 of F1 on the tallest peak, PHC1 = 0 as processed
+ax2 = ax2[keep]
+top = spec.max()
+rows = [peak(spec.max(axis=1), ax2, f)[0] for f in lines_f2]  # the F2 rows through the 19F lines
+at = ax2[rows]
+
+# --- F1 traces with infinite t1 and no window. The t1 signal of a 19F row is a sum of exponentials of the
+# eigenvalues of L (of pairs of them when the 19F 180 splits t1), so its F1 spectrum is exact: each line at its own width
+t2 = np.arange(n_t2) / sw_f2
+dft = np.exp(-np.pi * lb_f2 * t2)[:, None] * np.exp(-2j * np.pi * np.outer(t2, at))  # the F2 spectrum at those rows only
+t_in, t_out = t1_delays()
+a = np.exp(-1j * lam * t_in) * (V_inv @ start())  # the state at the start of t1, eigenmode by eigenmode
+maps = after_t1(np.eye(len(lam), dtype=complex))  # what each state at the end of t1 gives at the first point
+b = {name: (np.exp(-1j * phc0_f2) * dft.T @ acquire(m, n_t2)) @ V * np.exp(-1j * lam * t_out) for name, m in maps.items()}
+if refocus_t1:
+    B = V_inv @ pulse(V, 180, f="x")  # the 19F 180 between the two halves of t1
+    amp = {name: (bb[:, :, None] * B[None] * a[None, None, :]).reshape(len(rows), -1) for name, bb in b.items()}
+    mu = ((lam[:, None] + lam[None, :]) / 2).ravel()
+else:
+    amp = {name: bb * a for name, bb in b.items()}
+    mu = lam
+weight = np.max([np.abs(v).max(axis=0) for v in amp.values()], axis=0)
+use = (weight > 1e-7 * weight.max()) & (mu.imag < 0)
+amp, mu = {name: v[:, use] for name, v in amp.items()}, mu[use]
+
+
+def resolved(nu, row):
+    """F1 spectrum of one 19F row: the echo-antiecho signal sampled at 1/SW(F1) without end, the first point halved,
+    the PHC0 of F1 of the map"""
+    z = np.exp(-2j * np.pi * np.asarray(nu, dtype=float)[:, None] / sw_f1)
+
+    def series(q):  # sum over n >= 0 of (q z)^n, its first term halved
+        return 1 / (1 - q * z) - 0.5
+
+    s = series(np.exp(-1j * mu / sw_f1)) @ amp["antiecho"][row] + series(np.exp(1j * np.conj(mu) / sw_f1)) @ np.conj(amp["echo"][row])
+    return (np.exp(-1j * phc0_f1) * s).real
+
+
+def resolved_line(row, near):
+    """Height, position and FWHH of the line of the resolved trace near a frequency, on grids that zoom in on it"""
+    lo, hi = near - abs(J_CF) / 4, near + abs(J_CF) / 4
+    for _ in range(3):
+        grid = np.linspace(lo, hi, 801)
+        k, height, width = peak(resolved(grid, row), grid, near, half=hi - lo)
+        near, span = grid[k], 4 * max(width, 1e-3)
+        lo, hi = near - span, near + span
+    return height, near, width
+
+
+lo1, hi1 = max(centre_f1 - 2 * abs(J_CF) - 150, -sw_f1 / 2), min(centre_f1 + 2 * abs(J_CF) + 150, sw_f1 / 2)
+nu = np.unique(np.concatenate([np.linspace(lo1, hi1, 2001)] + [np.clip(f + np.linspace(-10, 10, 401), lo1, hi1) for f in lines_f1]))
+traces_inf = [resolved(nu, r) for r in range(len(rows))]
+traces = [spec[r] for r in rows]
+
+# --- What it prints ---
+t1_zero = sum(t1_delays()) - (P4 / 2 + DELTA + P1 / 2)  # net 13C evolution at the first t1 value
+print(f"{variant}: 19F at {nu_19F / 1e6:.3f} MHz, 13C at {nu_13C / 1e6:.3f} MHz, J(CF) = {J_CF:.1f} Hz, cnst2 = {cnst2:g} Hz")
+print(f"delays: d4 = {1e6 * D4:.0f} us, d24 = {d24:g} ms, DELTA = {1e6 * DELTA:.1f} us, DELTA1 = {1e6 * DELTA1:.1f} us; t1 to "
+      f"{1e3 * (n_t1 - 1) / sw_f1:.1f} ms ({n_t1} values, TD {td_f1} with echo and antiecho), t2 to {1e3 * (n_t2 - 1) / sw_f2:.1f} ms")
+print(f"t1 starts at {1e6 * t1_zero:+.1f} us of 13C evolution" + ("" if refocus_t1 else ", as DELTA still counts the 180 taken out of t1")
+      + f": a first-order F1 phase of {-360e3 * t1_zero:+.1f} deg per kHz, left in place (PHC1 = 0 as processed)")
+names = [f"19F m(13C) = {m:+.1f}" if not decouple_f2 else "19F, 13C decoupled" for m in m_C]
+found = {}
+for r in range(len(names)):
+    for m, f13 in zip(M_F, lines_f1):
+        k, h, w = peak(traces[r], ax1, f13)
+        found[(r, m)] = (ax1[k], h / top, w) + resolved_line(r, f13)
+tall = max(v[3] for v in found.values())
+print(f"\nF1 lines on the trace through each 19F line: as recorded ({n_t1} t1 values, {window_f1}), height relative to the"
+      f" tallest peak of the map; with infinite t1 and no window, height relative to the tallest such line")
+for r, (name, f19) in enumerate(zip(names, at)):
+    for m in M_F:
+        pos, h, w, h_inf, pos_inf, w_inf = found[(r, m)]
+        label = f"M_F = {m:+.1f}" if not refocus_t1 else "19F decoupled"
+        print(f"  {name} at {f19:+7.1f} Hz, {label} at {pos_inf:+7.1f} Hz: as recorded {h:5.2f} high, {w:5.1f} Hz wide; "
+              f"infinite t1 {h_inf / tall:5.2f} high, {w_inf:6.3g} Hz wide")
+# Each F1 line is a sum of Liouvillian modes at one frequency (the M_F = +-1/2 lines hold modes of different 19F
+# symmetry); the transfer, not only relaxation, sets how much of each a line carries
+f_modes = fold(-mu.real / (2 * np.pi), sw_f1)
+print("modes under each F1 line (width in Hz and share of the line, antiecho):" if not refocus_t1 else "", end="" if refocus_t1 else "\n")
+for r, name in enumerate([] if refocus_t1 else names):  # with the 19F 180 in t1 the terms are pairs of modes
+    parts = []
+    for m, f13 in zip(M_F, lines_f1):
+        near = np.flatnonzero(np.abs(f_modes - f13) < 2)
+        share = np.abs(amp["antiecho"][r][near])
+        share = share / share.sum() if share.sum() else share
+        top_modes = [i for i in np.argsort(-share) if share[i] >= 0.05]
+        parts.append(f"{m:+.1f}: " + " + ".join(f"{-mu.imag[near[i]] / np.pi:.3g} ({100 * share[i]:.0f}%)" for i in top_modes))
+    print(f"  {name}: M_F " + "; ".join(parts))
+k2, k1 = np.unravel_index(np.argmax(spec), spec.shape)
+row_f2 = spec[:, k1]
+for name, f19 in zip(names, lines_f2):
+    k, h, w = peak(row_f2, ax2, f19)
+    print(f"F2 trace through the tallest F1 line ({ax1[k1]:+.1f} Hz): {name} at {ax2[k]:+7.1f} Hz, height {h / top:5.2f}, width {w:5.1f} Hz (LB {lb_f2:g} Hz included)")
+narrow = min(found, key=lambda key: found[key][5])
+print(f"narrowest F1 line: {f'M_F = {narrow[1]:+.1f}' if not refocus_t1 else 'the 19F-decoupled line'} at {found[narrow][4]:+.1f} Hz on"
+      f" {names[narrow[0]]}, {found[narrow][5]:.3g} Hz wide with infinite t1, {found[narrow][2]:.3g} Hz as recorded")
+
+# --- The map and its traces ---
+win1 = np.abs(ax1 - centre_f1) <= 2 * abs(J_CF) + 150
+z = spec[:, win1].T / top
+show_image(np.maximum(z, 0) if -z.min() < 0.05 else z, ax2, ax1[win1], xlabel="F2: 19F offset (Hz)", ylabel="F1: 13C offset (Hz)",
+           title=f"{variant}: 19F-13C map at {magnet:g} T, TD {td_f2} x {td_f1}, EM {lb_f2:g} Hz x {window_f1}")
+order = ", ".join(f"{m:+.1f}" for _, m in sorted(zip(lines_f1, M_F), reverse=True))
+show_spectrum([t[win1] / top for t in traces], ax1[win1], names=[f"{n} ({f:+.0f} Hz)" for n, f in zip(names, at)], xlabel="F1: 13C offset (Hz)",
+              ylabel="intensity (tallest peak of the map = 1)", title=f"F1 traces as recorded: {n_t1} t1 values, {window_f1}"
+              + ("" if refocus_t1 else f"; M_F = {order} from the left"))
+show_spectrum([t / max(t.max() for t in traces_inf) for t in traces_inf], nu, names=[f"{n} ({f:+.0f} Hz)" for n, f in zip(names, at)],
+              xlabel="F1: 13C offset (Hz)", ylabel="intensity (tallest = 1)",
+              title="F1 traces with infinite t1, no window: each line at its own width")
+show_spectrum([row_f2 / top], ax2, names=[f"F2 through 13C {ax1[k1]:+.0f} Hz"], xlabel="F2: 19F offset (Hz)", ylabel="intensity (tallest peak = 1)",
+              title=f"F2 trace through the tallest F1 line, EM {lb_f2:g} Hz")
+</script>
+
 <script type="text/plain" class="example" id="ex-ulf-bf4" data-group="Relaxation (spynach)" data-title="11BF4- at ultralow field: level populations after an adiabatic transfer">
 import numpy as np
 import spynach

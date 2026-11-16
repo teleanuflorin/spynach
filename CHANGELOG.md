@@ -30,6 +30,17 @@ Releases are tagged `vX.Y.Z` on GitHub; the version is `spynach.__version__`.
   contributed suite's `run07_hsqc.m`, drawn as both maps and as their F1 traces through the 19F line, with a table
   of the F1 widths against the exact 1D lines. The parameter-form test now also runs every choice of a list and
   every checkbox flipped.
+- Playground example `try.html#ex-cf3-hsqcetgpsi`: the 19F-13C HSQC of the 13CF3 group run as the pulse program
+  ADhsqcetgpsi_nodecpl, Bruker's hsqcetgpsi without the 19F 180 in t1 and without 13C decoupling in acquisition, so
+  that both dimensions keep J(CF). The sequence goes pulse by pulse over Spynach's Liouvillian with the recorded
+  pulse lengths and delays (t1 starts 25 us early, as DELTA still counts the 180 taken out of t1), the two gradients
+  as coherence selections, and TopSpin's processing (EM and QSINE 2, one PHC0 of F2 for echo and antiecho before
+  they are combined). It draws the map at TD 1024 x 48, the F1 traces through both 19F lines as recorded and with
+  infinite t1 (from the exponentials of the t1 signal), and the F2 trace, and lists the Liouvillian modes under each
+  F1 line: the narrow M_F = -1/2 line is 1.0 Hz wide here against 0.73 Hz in the 13C spectrum, as the transfer
+  gives its broader 1.7 Hz mode two thirds of the line. Switches put the 19F 180 and the 13C decoupling back.
+  Without relaxation it matches a separate Hilbert-space simulation (four equal absorptive peaks for 13C-19F, the
+  3:1:1:3 quartet for 13CF3), and the infinite-t1 traces match a brute-force t1 of 3.4 s.
 - Relaxation at zero and ultralow field: `spynach.pathways.energy_levels` gives the eigenstates of the isotropic
   lab-frame Hamiltonian as levels `|K, F, M>`, sorted into blocks of conserved total projection and total spin of
   each group of equivalent spins. `Levels.adiabatic(from_field)` gives their populations after an adiabatic
