@@ -38,7 +38,9 @@ Releases are tagged `vX.Y.Z` on GitHub; the version is `spynach.__version__`.
   they are combined). It draws the map at TD 1024 x 48, the F1 traces through both 19F lines as recorded and with
   infinite t1 (from the exponentials of the t1 signal), and the F2 trace, and lists the Liouvillian modes under each
   F1 line: the narrow M_F = -1/2 line is 1.0 Hz wide here against 0.73 Hz in the 13C spectrum, as the transfer
-  gives its broader 1.7 Hz mode two thirds of the line. Switches put the 19F 180 and the 13C decoupling back.
+  gives its broader 1.7 Hz mode two thirds of the line. Switches put the 19F 180 and the 13C decoupling back, and
+  take the 13C or the 19F CSA out of the relaxation with all its cross-correlations (the 19F CSA alone broadens
+  that line from 0.25 to 1.0 Hz, while the 13C CSA makes the quartet asymmetric).
   Without relaxation it matches a separate Hilbert-space simulation (four equal absorptive peaks for 13C-19F, the
   3:1:1:3 quartet for 13CF3), and the infinite-t1 traces match a brute-force t1 of 3.4 s.
 - Relaxation at zero and ultralow field: `spynach.pathways.energy_levels` gives the eigenstates of the isotropic

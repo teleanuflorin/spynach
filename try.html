@@ -1191,6 +1191,8 @@ tau_c = 50.0  # GUI: Tumbling time | ns | Isotropic rotational correlation time 
 rotation = "50 ps"  # GUI: CF3 rotation time | - | Correlation time of the rotation of the CF3 group about its C3 axis, on top of the tumbling; rigid switches the rotation off | 1 ps, 2 ps, 5 ps, 10 ps, 20 ps, 50 ps, 100 ps, 200 ps, 500 ps, 1 ns, 2 ns, 5 ns, 10 ns, 20 ns, 50 ns, 100 ns, rigid
 parameter_set = "methionine"  # GUI: Parameter set | - | methionine: Ac-L-trifluoromethionine-NH2 (M06/cc-pVDZ, GIAO, SMD water) with its DFT J matrix; cf3ch3: ORCA CF3-CH3 model, 1J(CF) = -280 Hz | methionine, cf3ch3
 symmetrise = True  # GUI: C3-symmetrise | - | Make the group exactly C3-symmetric (mean geometry, C3 images of the averaged 19F tensor); off uses each fluorine's own DFT tensor
+csa_13C = True  # GUI: 13C CSA | - | Keep the 13C shielding anisotropy in the relaxation. Off removes it with all its cross-correlations, among them DD(CF)/CSA(C), which makes the 13C TROSY lines of F1
+csa_19F = True  # GUI: 19F CSA | - | Keep the 19F shielding anisotropies in the relaxation. Off removes them with all their cross-correlations, among them DD(CF)/CSA(F), which makes the 19F TROSY line of F2
 offset_19F = 0.0  # GUI: 19F offset | Hz | Of the CF3 line from the 19F carrier | -3000..3000
 offset_13C = 0.0  # GUI: 13C offset | Hz | Of the CF3 carbon from the 13C carrier | -500..500
 
@@ -1274,6 +1276,12 @@ if symmetrise:  # sites in order of azimuth; site j carries the C3 image of the 
     for s, a in zip(sites, turns):
         shifts[s] = rotz(a) @ fluorine @ rotz(-a)
         coords[s] = radius * np.array([np.sin(theta) * np.cos(azimuth[0] + a), np.sin(theta) * np.sin(azimuth[0] + a), np.cos(theta)])
+
+# A CSA switched off: the anisotropic part of that nucleus' shift tensors goes. In solution only the isotropic shift is
+# coherent, so this takes the CSA, and every cross-correlation with it, out of the Redfield relaxation and nothing else
+shifts = [s if (csa_13C if k == 0 else csa_19F) else np.zeros((3, 3)) for k, s in enumerate(shifts)]
+csa_off = [n for n, on in (("13C", csa_13C), ("19F", csa_19F)) if not on]
+no_csa = f", {' and '.join(csa_off)} CSA off" if csa_off else ""
 
 # The offsets as isotropic shifts (ppm of each nucleus' Larmor frequency)
 nu_19F, nu_13C = (spynach.isotopes.spin(n)[0] * magnet / (2 * np.pi) for n in ("19F", "13C"))
@@ -1522,7 +1530,7 @@ traces = [spec[r] for r in rows]
 
 # --- What it prints ---
 t1_zero = sum(t1_delays()) - (P4 / 2 + DELTA + P1 / 2)  # net 13C evolution at the first t1 value
-print(f"{variant}: 19F at {nu_19F / 1e6:.3f} MHz, 13C at {nu_13C / 1e6:.3f} MHz, J(CF) = {J_CF:.1f} Hz, cnst2 = {cnst2:g} Hz")
+print(f"{variant}{no_csa}: 19F at {nu_19F / 1e6:.3f} MHz, 13C at {nu_13C / 1e6:.3f} MHz, J(CF) = {J_CF:.1f} Hz, cnst2 = {cnst2:g} Hz")
 print(f"delays: d4 = {1e6 * D4:.0f} us, d24 = {d24:g} ms, DELTA = {1e6 * DELTA:.1f} us, DELTA1 = {1e6 * DELTA1:.1f} us; t1 to "
       f"{1e3 * (n_t1 - 1) / sw_f1:.1f} ms ({n_t1} values, TD {td_f1} with echo and antiecho), t2 to {1e3 * (n_t2 - 1) / sw_f2:.1f} ms")
 print(f"t1 starts at {1e6 * t1_zero:+.1f} us of 13C evolution" + ("" if refocus_t1 else ", as DELTA still counts the 180 taken out of t1")
@@ -1568,14 +1576,14 @@ print(f"narrowest F1 line: {f'M_F = {narrow[1]:+.1f}' if not refocus_t1 else 'th
 win1 = np.abs(ax1 - centre_f1) <= 2 * abs(J_CF) + 150
 z = spec[:, win1].T / top
 show_image(np.maximum(z, 0) if -z.min() < 0.05 else z, ax2, ax1[win1], xlabel="F2: 19F offset (Hz)", ylabel="F1: 13C offset (Hz)",
-           title=f"{variant}: 19F-13C map at {magnet:g} T, TD {td_f2} x {td_f1}, EM {lb_f2:g} Hz x {window_f1}")
+           title=f"{variant}{no_csa}: 19F-13C map at {magnet:g} T, TD {td_f2} x {td_f1}, EM {lb_f2:g} Hz x {window_f1}")
 order = ", ".join(f"{m:+.1f}" for _, m in sorted(zip(lines_f1, M_F), reverse=True))
 show_spectrum([t[win1] / top for t in traces], ax1[win1], names=[f"{n} ({f:+.0f} Hz)" for n, f in zip(names, at)], xlabel="F1: 13C offset (Hz)",
               ylabel="intensity (tallest peak of the map = 1)", title=f"F1 traces as recorded: {n_t1} t1 values, {window_f1}"
               + ("" if refocus_t1 else f"; M_F = {order} from the left"))
 show_spectrum([t / max(t.max() for t in traces_inf) for t in traces_inf], nu, names=[f"{n} ({f:+.0f} Hz)" for n, f in zip(names, at)],
               xlabel="F1: 13C offset (Hz)", ylabel="intensity (tallest = 1)",
-              title="F1 traces with infinite t1, no window: each line at its own width")
+              title=f"F1 traces with infinite t1, no window: each line at its own width{no_csa}")
 show_spectrum([row_f2 / top], ax2, names=[f"F2 through 13C {ax1[k1]:+.0f} Hz"], xlabel="F2: 19F offset (Hz)", ylabel="intensity (tallest peak = 1)",
               title=f"F2 trace through the tallest F1 line, EM {lb_f2:g} Hz")
 </script>
